@@ -95,6 +95,37 @@ def extract_poi(trace_iter, poi, cfg, n_total, verbose=True):
     return X, gain
 
 
+def fit_vertical_streaming(trace_iter, cfg, trace_len=TRACE_LEN):
+    """전체 트레이스(40,000 샘플) 기준 시간샘플별 평균/표준편차를 Welford로 누적한다.
+
+    Stage 2의 계수 불변 학습은 트레이스 전 구간에서 윈도우를 뽑으므로 POI 부분집합이
+    아니라 전 구간 통계가 필요하다. 12.2GB를 메모리에 올리지 않기 위한 스트리밍 경로.
+    v2가 set1의 앞 5,000개만 쓴 것과 달리 전량을 반영한다.
+    """
+    n = 0
+    mean = np.zeros(trace_len, dtype=np.float64)
+    m2 = np.zeros(trace_len, dtype=np.float64)
+    for _, _, chunk in trace_iter:
+        chunk = box_filter(chunk, cfg.moving_average)
+        if cfg.per_trace_gain:
+            center, scale = per_trace_scale(chunk, cfg.gain_estimator)
+            chunk = (chunk - center) / scale
+        c = np.asarray(chunk, dtype=np.float64)
+        cn = len(c)
+        cmean = c.mean(axis=0)
+        cm2 = ((c - cmean) ** 2).sum(axis=0)
+        delta = cmean - mean
+        tot = n + cn
+        mean += delta * (cn / tot)
+        m2 += cm2 + (delta ** 2) * (n * cn / tot)
+        n = tot
+    if n < 2:
+        raise ValueError("트레이스가 2개 미만")
+    std = np.sqrt(m2 / (n - 1))
+    std = np.where(std == 0, 1.0, std)
+    return mean.astype(np.float32), std.astype(np.float32), n
+
+
 def fit_vertical(X, robust=False):
     """POI별(=시간 샘플별) 중심/스케일. 전체 트레이스를 다 쓴다."""
     if robust:

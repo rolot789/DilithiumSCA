@@ -287,7 +287,90 @@ Stage 1을 지나면 **GE 수치가 v2 보고치보다 나빠 보일 수 있다.
 
 ---
 
-## 7. 메모리 지침
+## 7. Stage 2 구현 (`v3_stage2_data.py`, `v3_model.py`)
+
+### 7.1 계수 불변 파이프라인
+
+`build_normalized_memmap()`이 원본 int64 트레이스를 **정규화된 float16 memmap**으로
+1회 변환한다(12.2 GB -> 3.2 GB). 2패스 구조로, 1패스는 시간샘플별 통계를 Welford로
+누적하고 2패스는 정규화 결과를 디스크에 쓴다. 원본을 메모리에 올리지 않는다.
+
+`CoefficientWindowSampler`가 트레이스 전 구간에서 `(윈도우, HW)` 배치를 만든다.
+`build_time_map()`으로 계수 -> 시간 매핑을 주입하며, 이 값은 반드시
+`v3_common.calibrate_time_map()` 실측 결과를 써야 한다.
+
+에폭당 샘플 수: **30,000 -> 30,720,000 (1024배)**.
+
+합성 데이터 검증 결과, 서로 다른 다항식/계수에서 뽑은 윈도우가 하나의 정렬된
+표현으로 모인다(윈도우 중심 vs HW 상관계수 **0.9123**). 계수 불변 학습이
+성립한다는 근거다.
+
+### 7.2 증강은 랜덤 시간 이동으로
+
+샘플러의 `shift_aug`가 윈도우 중심을 +-n 샘플 흔든다. 이미 단위분산인 데이터에
+`GaussianNoise(0.05)`를 더하던 v2 방식과 달리 물리적으로 의미 있는 증강이며,
+정렬 오차에 대한 강건성을 직접 학습시킨다.
+
+### 7.3 경계 조건은 예외로 막는다
+
+`build_time_map()`은 매핑이 트레이스 범위를 벗어나면, `CoefficientWindowSampler`는
+`window/2 + shift_aug`가 경계를 넘으면 즉시 예외를 던진다. v2의 조용한 실패가
+재발할 수 없는 구조다.
+
+### 7.4 Stage 1과의 연결
+
+`predict_coefficient_probs()`가 `(n_traces, 33)` 확률 행렬을 만들어
+`v3_evaluate.fit_temperature` -> `trace_log_likelihood` -> `guessing_entropy`로
+그대로 넘긴다. 학습과 정직한 평가가 하나의 루프로 닫힌다.
+
+---
+
+## 8. Apple Silicon 최적화 (`v3_backend.py`)
+
+설치: `pip install tensorflow-macos tensorflow-metal`
+
+### 8.1 통합 메모리에 맞춘 데이터 경로
+
+M시리즈는 CPU/GPU가 RAM을 공유하므로 host->device 복사 비용이 없다. 대신 총량을
+공유하므로 사본을 늘리면 그대로 손해다. **float16 memmap + tf.data** 조합이 이
+구조에 가장 잘 맞으며, OS 페이지 캐시가 사실상 GPU 캐시 역할을 한다.
+
+### 8.2 배치 지역성 (가장 큰 성능 요인)
+
+무작위 `(trace, 계수)` 쌍을 흩뿌려 배치를 만들면 3.2 GB memmap 랜덤 접근이 되어
+페이지 폴트가 폭증한다. 샘플러는 대신 **적은 수의 트레이스만 읽고 그 안에서 계수를
+많이 뽑는다**(`traces_per_batch`). 트레이스 행 하나가 80 KB 연속 읽기라 지역성이
+크게 좋아진다. 또 제너레이터가 샘플이 아니라 **배치 단위**로 yield 해서 Python
+오버헤드가 샘플당이 아니라 배치당으로 줄어든다.
+
+### 8.3 P코어 / E코어
+
+M시리즈는 성능 코어와 효율 코어가 섞여 있다. intra-op 스레드를 논리코어 전체로
+잡으면 작업이 E코어로 밀려 오히려 느려진다. `performance_core_count()`가
+`sysctl hw.perflevel0.logicalcpu`로 P코어 수를 읽어 맞춘다. numpy(Accelerate)는
+`configure_numpy_threads()`로 제한하며, **numpy import 전에** 호출해야 한다.
+
+### 8.4 Metal 백엔드 주의사항
+
+| 항목 | 지침 |
+|---|---|
+| XLA (`jit_compile=True`) | Metal에서 미지원. `compile_kwargs()`가 항상 끈다 |
+| `mixed_float16` | 버전에 따라 불안정했다. 기본 off, 수치 확인 후에만 on |
+| Optimizer | TF 2.11+ 신규 Adam보다 `legacy.Adam`이 빠른 사례가 있어 우선 시도 |
+| Conv1D | `metal_safe=True`면 `(k,1)` Conv2D 경로 사용 |
+| float64 | MPS/Metal에서 취약. 파이프라인 전 구간 float32 유지 |
+
+`build_model(metal_safe=True)`가 기본값이다. Conv1D가 잘 도는 환경이면
+`metal_safe=False`로 두는 편이 그래프가 단순하다.
+
+### 8.5 원본 dtype
+
+트레이스가 int64로 저장되어 있어 set 하나가 3.05 GB다. ADC 데이터에 int64는
+4배 낭비이므로 **로드 즉시 float32로 캐스팅**하고, memmap에는 float16으로 쓴다.
+
+---
+
+## 9. 메모리 지침
 
 트레이스는 int64로 저장되어 있어 set 하나가 3.05 GB다. ADC 데이터에 int64는
 4배 낭비이므로 로드 즉시 float32로 캐스팅한다. `iter_profiling_traces()`가
