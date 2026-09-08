@@ -348,6 +348,42 @@ en.diversity_report([p[atk] for p in member_probs], y_atk[atk])
 모델을 여러 개 학습하기 부담스러우면 `en.make_snapshot_callback()`으로
 한 번의 학습에서 스냅샷 앙상블을 얻는다(cyclic LR, 비용 1/N).
 
+### 5d. Ranking Loss (실험용, 기본은 쓰지 않는다)
+
+`v3_ranking.py`에 구현되어 있고 기울기까지 검증했지만(유한차분 오차 2.68e-08),
+**실측에서 CE보다 나빴다.**
+
+| 손실 | Top-1 | PI(보정 전) | PI(보정 후) |
+|---|---|---|---|
+| CE 단독 | 20.39% | 0.691 | **0.710** |
+| CE + RkL | 14.89% | -10.143 | 0.215 |
+| RkL 위주(ce=0.2) | 15.10% | -20.119 | -0.219 |
+
+RkL은 누적 점수의 상대 순서만 제약해 로그확률의 절대 크기를 붙잡지 않는다.
+그래서 확신을 갖고 틀리는 상태가 되고 PI가 음수로 붕괴한다. 우리 공격은
+로그확률을 누적하므로 캘리브레이션이 곧 성능이다.
+
+굳이 시도한다면:
+
+```python
+import v3_ranking as rk
+s_star, c_vals = rk.synthesize_key_assignment(u_prof, POLY, COEFF, seed=0)
+print(rk.verify_assignment(c_vals, s_star, u_prof, POLY, COEFF))  # 잔여류 1.0 확인
+sam = rk.RankingBatchSampler(Xp, hw, u_prof, cm, train_idx, window=WINDOW,
+                             window_offset=OFFSET, n_groups=8, group_size=16,
+                             n_candidates=64, shift_aug=1, seed=0)
+m = rk.make_ranking_model(vm.build_model(window=WINDOW), alpha=1.0, ce_weight=1.0)
+m.compile(optimizer=bk.make_optimizer(1e-3), **bk.compile_kwargs())
+m.fit(rk.to_tf_dataset(sam, WINDOW), steps_per_epoch=1000, epochs=20)
+```
+
+**반드시** `ce_weight >= 1.0`, 학습 후 온도 보정, 그리고 PI를 CE 단독과 비교한다.
+PI가 낮으면 채택하지 않는다.
+
+프로파일링에 c/s가 없어 `synthesize_key_assignment()`로 (가짜키, challenge)를
+역산해 쓴다. 학습용 후보에 정답을 포함하는 것은 지도학습 라벨에 해당하므로
+정당하다 — **평가용 후보는 반드시 `v3_evaluate.build_candidate_residues()`** 를 쓴다.
+
 ### 6-d. 학습 방식 간 효율 비교 (PI)
 
 여러 학습 방식을 시도했다면 **PI(Perceived Information)** 로 비교한다.

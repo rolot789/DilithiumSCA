@@ -51,7 +51,10 @@ def scale_to_full_space(rank, n_candidates):
 def fit_temperature(probs_cal, y_cal, grid=None):
     """캘리브레이션셋 NLL을 최소화하는 온도. 공격셋을 절대 쓰지 않는다."""
     if grid is None:
-        grid = np.concatenate([np.linspace(0.2, 3.0, 29), np.linspace(3.2, 10.0, 35)])
+        # 상한을 30까지 둔다. ranking loss처럼 과신이 심한 모델은 T=10에서
+        # 그리드 경계에 닿아 보정이 덜 된 채로 통과한다.
+        grid = np.concatenate([np.linspace(0.2, 3.0, 29), np.linspace(3.2, 10.0, 35),
+                               np.linspace(10.5, 30.0, 20)])
     P = np.clip(np.asarray(probs_cal, dtype=np.float64), 1e-12, 1.0)
     logp = np.log(P)
     best_t, best_nll = 1.0, np.inf
