@@ -300,6 +300,54 @@ attack = rp.attack_report(probs[cal], y_atk[cal], probs[atk], c_atk[atk],
 - 온도를 공격셋에서 고르지 말 것
 - 동점 처리를 빼지 말 것 (GE가 0으로 붕괴해 성공한 것처럼 보인다)
 
+### 5c. 앙상블 (선택)
+
+```python
+import v3_ensemble as en
+
+specs = en.recommended_specs()      # 넓은 창 1개 + disjoint 보조 4개
+members = []
+for i, sp in enumerate(specs):
+    tr = s2.CoefficientWindowSampler(Xp, hw, cm, train_idx, batch_size=512,
+                                     traces_per_batch=32, shift_aug=1, seed=i, **sp)
+    va = s2.CoefficientWindowSampler(Xp, hw, cm, val_idx, batch_size=512,
+                                     traces_per_batch=32, shift_aug=0, seed=100+i, **sp)
+    m = vm.compile_model(vm.build_model(window=sp["window"]))
+    m.fit(s2.to_tf_dataset(tr), validation_data=s2.to_tf_dataset(va),
+          steps_per_epoch=1000, validation_steps=100, epochs=30,
+          callbacks=vm.make_callbacks(f"{WORK}/ens{i}.keras"))
+    members.append((m, sp))
+
+ens = en.Ensemble(members)
+factory = lambda sp: s2.CoefficientWindowSampler(Xa, hw_atk, cm, np.arange(vc.N_ATTACK),
+                                                 batch_size=512, traces_per_batch=32,
+                                                 shift_aug=0, seed=2, **sp)
+_, member_probs = ens.predict(factory, np.arange(vc.N_ATTACK), POLY, COEFF)
+ens.calibrate([p[cal] for p in member_probs], y_atk[cal])    # 공격셋 미사용
+probs_ens = en.combine_probs(member_probs, ens.mode, ens.weights)
+print(en.ensemble_gain([p[atk] for p in member_probs], y_atk[atk], ens.mode, ens.weights))
+en.diversity_report([p[atk] for p in member_probs], y_atk[atk])
+```
+
+**다양성 구성 선택 근거** (선형 프로브 실측):
+
+| 구성 | 오차 상관 | 앙상블 이득 |
+|---|---|---|
+| 배깅 (같은 창) | 0.946 | 1.003배 |
+| 중첩 창 (폭만 확대) | 0.432 | 1.018배 |
+| disjoint 창 | 0.258 | 1.195배 |
+| 넓은 창 + disjoint | - | 1.108배 (절대 PI 최고) |
+
+**중첩 창(폭만 다른 창)을 멤버로 쓰지 말 것.** 넓은 창이 좁은 창을 포함해
+우열 관계가 되고 가중치가 한쪽에 몰린다. 폭 확대는 단일 모델 설정으로 쓴다.
+
+`diversity_report`의 오차 상관이 0.8을 넘으면 멤버가 너무 비슷한 것이므로
+구성을 바꾼다. 다만 **선형 프로브 수치는 신경망을 과소평가**하므로
+배깅 1.003배를 "시드 앙상블 무용"으로 읽지 말고 PI로 직접 확인한다.
+
+모델을 여러 개 학습하기 부담스러우면 `en.make_snapshot_callback()`으로
+한 번의 학습에서 스냅샷 앙상블을 얻는다(cyclic LR, 비용 1/N).
+
 ### 6-d. 학습 방식 간 효율 비교 (PI)
 
 여러 학습 방식을 시도했다면 **PI(Perceived Information)** 로 비교한다.
