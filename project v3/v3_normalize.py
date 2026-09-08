@@ -24,7 +24,7 @@ from v3_common import N_HW_CLASSES, TRACE_LEN, hw32
 
 @dataclass
 class NormConfig:
-    moving_average: int = 1          # 1이면 필터 없음 (v2는 5)
+    moving_average: int = 7          # 실측 최적값. 스윕 결과는 아래 주석 참조
     per_trace_gain: bool = True      # v2에는 없던 단계
     gain_estimator: str = "mad"      # "mad" | "std"
     vertical: bool = True
@@ -44,7 +44,13 @@ _MAD_TO_SIGMA = 1.4826
 
 def box_filter(X, w):
     """이동평균. v2의 np.convolve(mode='same')는 양 끝을 0으로 패딩해 경계를
-    왜곡시킨다. 여기서는 edge 패딩 + 누적합이라 경계가 안전하고 훨씬 빠르다."""
+    왜곡시킨다. 여기서는 edge 패딩 + 누적합이라 경계가 안전하고 훨씬 빠르다.
+
+    실제 공격 트레이스 600개로 스윕한 결과(1024계수 중 64개 표본, |rho| 평균):
+        MA=1  0.6653   MA=3  0.7312   MA=5  0.7434   MA=7  0.7589 (최적)
+        MA=9  0.7442   MA=11 0.7192   MA=15 0.6650
+    필터는 확실히 도움이 되며 7 부근이 정점이다. v2의 5는 근접했지만 최적은 아니었다.
+    """
     if not w or w <= 1:
         return X
     pad_l, pad_r = w // 2, w - 1 - w // 2
@@ -55,7 +61,13 @@ def box_filter(X, w):
 
 
 def per_trace_scale(X, estimator="mad"):
-    """트레이스별 (중심, 스케일). 트레이스 전체 구간에서 재야 신호가 보존된다."""
+    """트레이스별 (중심, 스케일). 트레이스 전체 구간에서 재야 신호가 보존된다.
+
+    실측 주의: 공격 캠페인 *내부*에서는 이 보정의 효과가 거의 없다
+    (|rho| 0.7427 -> 0.7434). 실제 트레이스에 트레이스별 이득 편차가 크지 않다는 뜻이다.
+    이 단계의 가치는 캠페인 *간* 이식성에 있으며, 프로파일링 트레이스를 확보하기
+    전에는 검증되지 않았다. 해롭지 않으므로 기본 활성으로 둔다.
+    """
     if estimator == "mad":
         center = np.median(X, axis=1, keepdims=True)
         scale = np.median(np.abs(X - center), axis=1, keepdims=True) * _MAD_TO_SIGMA

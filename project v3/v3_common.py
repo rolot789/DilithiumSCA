@@ -121,6 +121,63 @@ def calibrate_time_map(traces, u_labels, j, coeff_list, search_lo=0, search_hi=T
     return float(coeff_stride), float(offset), peaks
 
 
+def calibrate_time_map_dense(traces, u_labels, anchors, anchor_peaks,
+                             search_radius=120, verbose=True):
+    """1024개 계수 위치를 전부 실측해 (L_POLY, N_COEFF) 테이블을 만든다.
+
+    선형 적합은 쓰지 않는다. 실측 결과 poly0는 계수당 약 35샘플, poly2/3은 약 30샘플,
+    poly1은 앞부분 35에서 뒷부분 30으로 서서히 바뀌며, 어느 다항식도 간격이 정확히
+    일정하지 않다(27~37 사이에서 흔들림). 직선 하나로는 poly1에서 145샘플까지
+    어긋난다.
+
+    anchors      : 앵커로 쓸 계수 인덱스 리스트
+    anchor_peaks : {poly: [각 앵커의 실측 피크 위치]}
+    반환         : (centers, quality) — quality는 각 위치의 |rho|
+    """
+    X = np.asarray(traces, dtype=np.float64)
+    X = X - X.mean(axis=0)
+    Xn = np.sqrt((X ** 2).sum(axis=0))
+    Xn[Xn == 0] = 1.0
+    n_time = X.shape[1]
+
+    centers = np.zeros((L_POLY, N_COEFF), dtype=np.int64)
+    quality = np.zeros((L_POLY, N_COEFF), dtype=np.float64)
+    for j in range(L_POLY):
+        coarse = np.interp(np.arange(N_COEFF), anchors, anchor_peaks[j])
+        for k in range(N_COEFF):
+            c = int(round(coarse[k]))
+            lo, hi = max(0, c - search_radius), min(n_time, c + search_radius + 1)
+            h = hw32(u_labels[:len(X), j, k]).astype(np.float64)
+            h -= h.mean()
+            d = np.sqrt((h ** 2).sum())
+            if d == 0:
+                raise ValueError(f"poly{j} coeff{k}: HW 분산이 0")
+            r = (X[:, lo:hi] * h[:, None]).sum(axis=0) / (Xn[lo:hi] * d)
+            a = int(np.argmax(np.abs(r)))
+            centers[j, k] = lo + a
+            quality[j, k] = abs(r[a])
+    if verbose:
+        print(f"  |rho| 중앙값 {np.median(quality):.4f}, 최소 {quality.min():.4f}, "
+              f"0.3 미만 {int((quality < 0.3).sum())}/{L_POLY * N_COEFF}개")
+    return centers, quality
+
+
+def save_time_map(centers, quality, path):
+    """실측 시간 매핑을 JSON으로 저장한다 (.npy는 gitignore 대상이라 텍스트로 남긴다)."""
+    import json
+    with open(path, "w") as f:
+        json.dump({"centers": np.asarray(centers).tolist(),
+                   "quality_median": float(np.median(quality)),
+                   "quality_min": float(np.min(quality))}, f)
+
+
+def load_time_map(path):
+    import json
+    with open(path) as f:
+        d = json.load(f)
+    return np.array(d["centers"], dtype=np.int64)
+
+
 def verify_dataset(dataset_dir, n_check=200, verbose=True):
     """Stage 0 게이트. 여기를 통과하지 못하면 이후 단계를 진행하지 않는다."""
     report = {}

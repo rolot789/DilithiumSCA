@@ -25,14 +25,22 @@ from v3_normalize import box_filter, per_trace_scale
 def build_time_map(poly_params):
     """계수 -> 시간샘플 중심 매핑 (L_POLY, N_COEFF).
 
-    poly_params: [(stride, offset), ...] 다항식별 4개.
-    v3_common.calibrate_time_map()의 실측 결과를 그대로 넣는다.
+    실측 테이블 (L_POLY, N_COEFF)을 그대로 넘기는 것을 권장한다
+    (v3_common.calibrate_time_map_dense / load_time_map).
+
+    [(stride, offset), ...] 형태의 선형 파라미터도 받지만 어디까지나 근사다.
+    실측 결과 계수 간격이 27~37 사이에서 흔들리고 poly1은 앞부분 35에서 뒷부분
+    30으로 바뀌어, 직선 적합은 poly1에서 145샘플까지 어긋난다.
     """
-    if len(poly_params) != L_POLY:
-        raise ValueError(f"다항식 {L_POLY}개 파라미터 필요, {len(poly_params)}개 받음")
-    k = np.arange(N_COEFF, dtype=np.float64)
-    centers = np.stack([offset + stride * k for stride, offset in poly_params])
-    centers = np.rint(centers).astype(np.int64)
+    arr = np.asarray(poly_params)
+    if arr.ndim == 2 and arr.shape == (L_POLY, N_COEFF):
+        centers = arr.astype(np.int64)
+    else:
+        if len(poly_params) != L_POLY:
+            raise ValueError(f"다항식 {L_POLY}개 파라미터 필요, {len(poly_params)}개 받음")
+        k = np.arange(N_COEFF, dtype=np.float64)
+        centers = np.rint(np.stack([offset + stride * k
+                                    for stride, offset in poly_params])).astype(np.int64)
     if centers.min() < 0 or centers.max() >= TRACE_LEN:
         raise ValueError(f"시간 매핑이 트레이스 범위를 벗어남: "
                          f"{centers.min()} ~ {centers.max()} (허용 0~{TRACE_LEN-1})")
