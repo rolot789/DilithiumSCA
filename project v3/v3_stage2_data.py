@@ -52,6 +52,22 @@ def precompute_hw_labels(u_labels):
     return hw32(np.asarray(u_labels)).astype(np.int8)
 
 
+def precompute_multitask_labels(u_labels, head_names=None):
+    """멀티태스크 헤드별 라벨을 미리 만든다.
+
+    HW 하나(H=4.215비트)보다 바이트별 HW를 나눠 예측하는 쪽이 트레이스당 정보량이
+    크다(헤드 합 8.78비트, 약 2.1배). 정보량이 2배면 필요한 트레이스 수가 절반이다.
+
+    주의: byte3은 사실상 8 x 부호비트다. |u| < 2^23이라 상위 9비트가 전부 부호
+    확장이기 때문이며, 실측에서 bit24/bit28/bit31의 |rho|가 0.7238로 완전히 같다.
+    그래서 기본 헤드 조합에서 byte3을 빼고 sign을 쓴다.
+    """
+    from v3_benchmark import MULTITASK_HEADS, SCHEMES
+    names = head_names or MULTITASK_HEADS
+    u = np.asarray(u_labels)
+    return {n: SCHEMES[n](u).astype(np.int8) for n in names}
+
+
 def build_normalized_memmap(trace_iter_factory, out_path, cfg, n_total,
                             trace_len=TRACE_LEN, verbose=True):
     """정규화된 트레이스를 float16 memmap으로 1회 생성한다.
@@ -115,13 +131,28 @@ class CoefficientWindowSampler:
 
     def __init__(self, traces, hw_labels, centers, trace_indices,
                  window=64, batch_size=512, traces_per_batch=32,
-                 shift_aug=0, poly_subset=None, coeff_subset=None, seed=0):
+                 shift_aug=0, poly_subset=None, coeff_subset=None, seed=0,
+                 window_offset=0, extra_labels=None):
+        """window_offset: 윈도우 중심을 피크에서 얼마나 뒤로 밀 것인가.
+
+        실측 결과 계수 하나가 **여러 지점에서 누설한다**. poly0/coeff50 기준
+        피크 상대위치와 |rho|:
+            -1(0.807)  +15(0.650)  +24(0.662)  +36(0.311)  +55(0.251)  +64(0.202)
+        window=32(-16~+16)는 앞의 두 개만 담고 +24 이후를 통째로 버린다.
+        window=96, window_offset=24로 두면 -24~+72를 담아 6개를 모두 포함한다.
+
+        extra_labels: {헤드이름: (n,4,256) 배열} 멀티태스크 학습용.
+        주면 배치의 y가 dict로 나온다.
+        """
         if batch_size % traces_per_batch != 0:
             raise ValueError("batch_size는 traces_per_batch의 배수여야 함")
         if window % 2 != 0:
             raise ValueError("window는 짝수를 권장 (중심 정렬)")
         self.traces = traces
         self.hw = hw_labels
+        self.extra_labels = extra_labels or {}
+        self.window_offset = int(window_offset)
+        centers = np.asarray(centers) + self.window_offset
         self.centers = centers
         self.idx = np.asarray(trace_indices)
         self.window = window
@@ -153,6 +184,8 @@ class CoefficientWindowSampler:
             trace_sel = self.rng.choice(self.idx, self.traces_per_batch, replace=False)
             X = np.empty((self.batch_size, self.window), dtype=np.float32)
             y = np.empty(self.batch_size, dtype=np.int32)
+            extra = {k: np.empty(self.batch_size, dtype=np.int32)
+                     for k in self.extra_labels}
             pos = 0
             for ti in trace_sel:
                 row = np.asarray(self.traces[ti], dtype=np.float32)   # 연속 읽기
@@ -166,8 +199,10 @@ class CoefficientWindowSampler:
                     s = cen[m] - half
                     X[pos] = row[s:s + self.window]
                     y[pos] = self.hw[ti, pj[m], pk[m]]
+                    for k, arr in self.extra_labels.items():
+                        extra[k][pos] = arr[ti, pj[m], pk[m]]
                     pos += 1
-            yield X[:, :, None], y
+            yield (X[:, :, None], dict(extra, hw=y) if extra else y)
 
     def full_coefficient_batch(self, trace_index, poly, coeff_list):
         """공격/평가용: 한 트레이스에서 지정 계수들의 윈도우를 한 번에 뽑는다."""

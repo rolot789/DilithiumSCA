@@ -70,6 +70,58 @@ def build_model(window, n_classes=N_HW_CLASSES, width=32, n_blocks=3,
     return Model(inp, out, name="coeff_invariant_cnn")
 
 
+def build_multitask_model(window, heads=None, width=32, n_blocks=3,
+                          kernel=7, dropout=0.1, head_dropout=0.3,
+                          metal_safe=True, include_hw=True):
+    """공유 트렁크 + 헤드 여러 개.
+
+    HW 하나만 예측하면 트레이스당 4.215비트가 상한이다. 바이트별 HW를 나눠
+    예측하면 헤드 합이 8.78비트로 약 2.1배가 되고, 필요한 트레이스 수가 절반이 된다.
+    (v3_benchmark의 실측 근거 참조)
+
+    헤드끼리 정보가 겹치므로 합이 그대로 실현되지는 않는다. 반드시 PI와 실측 GE로
+    검증할 것.
+    """
+    from tensorflow.keras import layers, Model
+    from v3_benchmark import MULTITASK_HEADS, SCHEMES
+
+    heads = heads or MULTITASK_HEADS
+    inp = layers.Input(shape=(window, 1), name="window")
+    x = layers.Reshape((window, 1, 1))(inp) if metal_safe else inp
+    x = _conv(x, width, kernel, metal_safe, name="stem")
+    x = layers.BatchNormalization()(x)
+    x = layers.Activation("relu")(x)
+    for b in range(n_blocks):
+        x = _residual_block(x, width * (2 ** b), kernel, metal_safe, dropout)
+    x = layers.GlobalAveragePooling2D()(x) if metal_safe else layers.GlobalAveragePooling1D()(x)
+    trunk = layers.Dense(128, activation="relu", name="trunk")(x)
+    trunk = layers.Dropout(head_dropout)(trunk)
+
+    outs = {}
+    for h in heads:
+        outs[h] = layers.Dense(SCHEMES[h].n_classes, activation="softmax",
+                               dtype="float32", name=h)(trunk)
+    if include_hw:
+        outs["hw"] = layers.Dense(N_HW_CLASSES, activation="softmax",
+                                  dtype="float32", name="hw")(trunk)
+    return Model(inp, outs, name="coeff_invariant_multitask")
+
+
+def compile_multitask(model, learning_rate=1e-3, label_smoothing=0.05,
+                      loss_weights=None):
+    """헤드별 sparse CE. class_weight는 쓰지 않는다(확률이 왜곡된다)."""
+    import tensorflow as tf
+    from v3_backend import compile_kwargs, make_optimizer
+
+    losses = {n: tf.keras.losses.SparseCategoricalCrossentropy()
+              for n in model.output_names}
+    model.compile(optimizer=make_optimizer(learning_rate), loss=losses,
+                  loss_weights=loss_weights,
+                  metrics={n: "accuracy" for n in model.output_names},
+                  **compile_kwargs())
+    return model
+
+
 def compile_model(model, learning_rate=1e-3, label_smoothing=0.05):
     """class_weight 없이 표준 CE + label smoothing. Metal에서는 XLA를 끈다."""
     import tensorflow as tf

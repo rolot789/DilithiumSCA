@@ -168,14 +168,15 @@ hw     = s2.precompute_hw_labels(u_prof)
 cm     = s2.build_time_map(centers)
 train_idx, val_idx = s2.set_split_indices(val_set=4)   # leave-one-set-out
 
-train = s2.CoefficientWindowSampler(Xp, hw, cm, train_idx, window=32,
-                                    batch_size=512, traces_per_batch=32,
-                                    shift_aug=1, seed=0)
-val   = s2.CoefficientWindowSampler(Xp, hw, cm, val_idx, window=32,
-                                    batch_size=512, traces_per_batch=32,
-                                    shift_aug=0, seed=1)
+WINDOW, OFFSET = 96, 24    # 실측 근거는 아래 참조
+train = s2.CoefficientWindowSampler(Xp, hw, cm, train_idx, window=WINDOW,
+                                    window_offset=OFFSET, batch_size=512,
+                                    traces_per_batch=32, shift_aug=1, seed=0)
+val   = s2.CoefficientWindowSampler(Xp, hw, cm, val_idx, window=WINDOW,
+                                    window_offset=OFFSET, batch_size=512,
+                                    traces_per_batch=32, shift_aug=0, seed=1)
 
-model = vm.compile_model(vm.build_model(window=32, metal_safe=True))
+model = vm.compile_model(vm.build_model(window=WINDOW, metal_safe=True))
 model.summary()
 
 history = model.fit(
@@ -188,8 +189,38 @@ history = model.fit(
 )
 ```
 
+**`window` / `window_offset` 선택 근거**: 계수 하나가 **6~7개 지점에서 누설**한다
+(poly0/coeff50 기준 상대위치 -1, +15, +24, +36, +55, +64). `window=32`는 앞의 두
+개만 담는다. 넓혀서 실측한 |rho|는 다음과 같다.
+
+```
+window= 32 offset= 0  0.7974 (기준)     window= 96 offset=24  0.8748 (+9.7%)
+window= 64 offset=16  0.8587 (+7.7%)    window=128 offset=32  0.8966 (+12.4%)
+                                        window=160 offset=40  0.9067 (+13.7%)
+```
+
+96~128이 권장 구간이다. 그 이상은 수확체감이고 이웃 계수와의 중첩이 커진다.
+
 **`shift_aug` 선택 근거** (실측 |rho|): 0칸 0.7399 / 1칸 0.7236 / 3칸 0.6647 /
 5칸 0.5656. 시간 매핑이 정확하므로 **1~2칸을 권장**한다.
+
+### 5b. 멀티태스크 변형 (정보량 2.1배)
+
+HW 하나만 예측하면 정보량 상한이 4.151비트다. sign/byte0/byte1/byte2로 나누면
+헤드 합이 8.736비트로 **2.10배**가 되고 필요한 트레이스가 5.5개에서 2.6개로 준다.
+
+```python
+extra = s2.precompute_multitask_labels(u_prof)     # sign, byte0, byte1, byte2
+train_mt = s2.CoefficientWindowSampler(Xp, hw, cm, train_idx, window=WINDOW,
+                                       window_offset=OFFSET, batch_size=512,
+                                       traces_per_batch=32, shift_aug=1, seed=0,
+                                       extra_labels=extra)
+mt = vm.compile_multitask(vm.build_multitask_model(window=WINDOW))
+```
+
+**주의**: byte0/byte1은 누설이 약하다(|rho| 0.24~0.30). 헤드끼리 정보가 겹치므로
+8.736비트가 그대로 실현되지 않는다. **반드시 PI와 실측 GE로 검증한다**(Step 6d).
+byte3은 사실상 8 x 부호비트라 기본 헤드에서 제외되어 있다.
 
 **주의사항**
 - `class_weight`를 쓰지 말 것. focal loss와 이중 적용되면 확률이 왜곡되고
@@ -268,6 +299,33 @@ attack = rp.attack_report(probs[cal], y_atk[cal], probs[atk], c_atk[atk],
 - 후보군을 `attack_s.npy`에서 만들지 말 것 (v2의 치명적 오류, 32,736배 축소)
 - 온도를 공격셋에서 고르지 말 것
 - 동점 처리를 빼지 말 것 (GE가 0으로 붕괴해 성공한 것처럼 보인다)
+
+### 6-d. 학습 방식 간 효율 비교 (PI)
+
+여러 학습 방식을 시도했다면 **PI(Perceived Information)** 로 비교한다.
+정확도는 라벨 종류가 다르면 비교 자체가 불가능하지만 PI는 같은 비트 단위다.
+
+```python
+import v3_benchmark as bm
+
+v = bm.Variant("멀티태스크 w96", "sign+byte0~2, window=96", scheme="multitask", window=96)
+m = bm.evaluate_variant(v, probs, y_atk, n_params=model.count_params(),
+                        train_seconds=elapsed, train_samples=train.samples_per_epoch(),
+                        sr100=attack["traces_to_sr100"], oracle_sr100=6)
+all_metrics.append(m)
+bm.render_benchmark(f"{WORK}/benchmark.md", all_metrics)
+```
+
+**해석**
+- `pi_bits`: 트레이스 하나에서 실제로 뽑아낸 정보량. 클수록 좋다.
+- `predicted_traces` = 23.0 / PI. 실측 SR100과 대조하면 지표 신뢰도를 알 수 있다
+  (검증 시 예측/실측 비 1.02였다).
+- **`pi_bits`가 음수면 즉시 중단한다.** 모델이 확신을 갖고 틀리는 상태이며,
+  정보를 주는 게 아니라 뺏고 있다. 정확도로는 이 상태가 안 보인다.
+- `pi_ratio` = PI / H(Y). 그 라벨의 이론적 상한에 얼마나 근접했는지다.
+
+기준값: HW 라벨의 H(Y)=4.151비트, 멀티태스크 헤드 합 8.736비트.
+완벽 오라클은 HW로 6개, 바이트별로 약 3개 트레이스다.
 
 ---
 
