@@ -117,17 +117,34 @@ def combined_pi(pi_list):
 
 # ------------------------------------------------------------- 변형 실행
 
+# 앙상블 다양성 구성별 실측 기준값 (선형 프로브, 실제 트레이스 600+600개).
+# 새로 잰 앙상블이 이 표의 어디에 해당하는지 대조하는 용도다.
+DIVERSITY_REFERENCE = {
+    "single":   {"label": "단일 모델",              "error_corr": None,  "gain": 1.000},
+    "bagging":  {"label": "배깅(같은 창, 데이터 재추출)", "error_corr": 0.946, "gain": 1.003},
+    "nested":   {"label": "중첩 창(폭만 확대)",       "error_corr": 0.432, "gain": 1.018},
+    "disjoint": {"label": "disjoint 창",           "error_corr": 0.258, "gain": 1.195},
+    "mixed":    {"label": "넓은 창 + disjoint",     "error_corr": None,  "gain": 1.108},
+}
+
+
 class Variant:
-    """비교할 학습 방식 하나."""
+    """비교할 학습 방식 하나.
+
+    ensemble: 앙상블이면 {"source": "disjoint"|"bagging"|"nested"|"mixed"|"snapshot",
+                          "n_members": int, "specs": [...]} 형태의 dict.
+              단일 모델이면 None.
+    """
 
     def __init__(self, name, description, build_fn=None, scheme="hw32",
-                 window=32, extra=None):
+                 window=32, extra=None, ensemble=None):
         self.name = name
         self.description = description
         self.build_fn = build_fn
         self.scheme = scheme
         self.window = window
         self.extra = extra or {}
+        self.ensemble = ensemble
         self.metrics = {}
 
     def record(self, **kw):
@@ -168,7 +185,42 @@ def evaluate_variant(variant, probs, y_true, n_params=None, train_seconds=None,
     # 학습 비용 대비 정보량
     if train_seconds and train_seconds > 0:
         m["pi_per_minute"] = info["pi"] / (train_seconds / 60.0)
+    if variant.ensemble:
+        m["ensemble"] = dict(variant.ensemble)
     variant.record(**m)
+    return m
+
+
+def evaluate_ensemble_variant(variant, member_probs, y_true, mode="mean",
+                              weights=None, **kw):
+    """앙상블 변형을 평가한다. 멤버 확률 리스트를 받아 다양성과 이득까지 채운다.
+
+    variant.ensemble["source"]에 다양성 원천을 적어두면 비교표에서
+    DIVERSITY_REFERENCE의 실측 기준값과 나란히 볼 수 있다.
+    """
+    import v3_ensemble as ve            # 순환 임포트 방지를 위한 지연 임포트
+
+    combined = ve.combine_probs(member_probs, mode, weights)
+    m = evaluate_variant(variant, combined, y_true, **kw)
+
+    div = ve.diversity_report(member_probs, y_true, verbose=False)
+    gain = ve.ensemble_gain(member_probs, y_true, mode, weights)
+    info = dict(variant.ensemble or {})
+    info.update({
+        "n_members": div["n_members"],
+        "combine_mode": mode,
+        "weights": None if weights is None else [float(w) for w in weights],
+        "error_correlation": div["mean_error_correlation"],
+        "disagreement": div["mean_disagreement"],
+        "member_pi": gain["member_pi"],
+        "best_member_pi": gain["best_member_pi"],
+        "mean_member_pi": gain["mean_member_pi"],
+        "gain_over_best": gain["gain_over_best"],
+        "gain_ratio": gain["gain_ratio"],
+        "predicted_traces_best": gain["predicted_traces_best"],
+    })
+    m["ensemble"] = info
+    variant.record(ensemble=info)
     return m
 
 
@@ -183,20 +235,78 @@ class Timer:
 
 # ------------------------------------------------------------------ 비교표
 
+def _config_label(m):
+    """표에 쓸 구성 요약. 단일 모델이면 '단일', 앙상블이면 '앙상블 N개(원천)'."""
+    e = m.get("ensemble")
+    if not e:
+        return "단일"
+    src = e.get("source", "?")
+    ref = DIVERSITY_REFERENCE.get(src)
+    name = ref["label"] if ref else src
+    return f"앙상블 {e.get('n_members', '?')}개 · {name}"
+
+
 def comparison_table(metrics_list, sort_by="pi_bits"):
     """변형들을 한 표로 비교한다. 정렬 기준은 기본이 PI다."""
     rows = sorted(metrics_list, key=lambda m: m.get(sort_by, 0), reverse=True)
     L = []
     A = L.append
-    A("| 학습 방식 | 라벨 | Top-1 | 베이스라인 배율 | **PI (비트)** | H(Y) | PI/H | 예측 트레이스 | 실측 SR100 |")
-    A("|---|---|---|---|---|---|---|---|---|")
+    A("| 학습 방식 | 구성 | 라벨 | Top-1 | 베이스라인 배율 | **PI (비트)** | H(Y) | PI/H | 예측 트레이스 | 실측 SR100 |")
+    A("|---|---|---|---|---|---|---|---|---|---|")
     for m in rows:
         pred = m["predicted_traces"]
         pred_s = f"{pred:.1f}" if np.isfinite(pred) else "무한"
-        A(f"| {m['name']} | {m['scheme']} | {m['top1']*100:.2f}% | "
+        A(f"| {m['name']} | {_config_label(m)} | {m['scheme']} | {m['top1']*100:.2f}% | "
           f"{m['acc_ratio']:.2f}x | **{m['pi_bits']:.3f}** | "
           f"{m['label_entropy']:.3f} | {m['pi_ratio']*100:.1f}% | "
           f"{pred_s} | {m.get('measured_sr100') or '-'} |")
+    return "\n".join(L)
+
+
+def ensemble_table(metrics_list):
+    """앙상블 변형만 따로, 다양성과 이득 중심으로 본다.
+
+    오차 상관이 낮을수록 멤버들이 서로 다른 실수를 하므로 이득이 크다.
+    상관이 0.8을 넘으면 멤버가 사실상 같은 모델이라 앙상블 의미가 없다.
+    """
+    ens = [m for m in metrics_list if m.get("ensemble")]
+    if not ens:
+        return "_앙상블 변형 없음_"
+    L = []
+    A = L.append
+    A("| 학습 방식 | 다양성 원천 | 멤버 | 결합 | 오차 상관 | 불일치율 | "
+      "최고 멤버 PI | 앙상블 PI | 이득 | 예측 트레이스 |")
+    A("|---|---|---|---|---|---|---|---|---|---|")
+    for m in sorted(ens, key=lambda x: x["pi_bits"], reverse=True):
+        e = m["ensemble"]
+        src = e.get("source", "?")
+        ref = DIVERSITY_REFERENCE.get(src)
+        ec = e.get("error_correlation")
+        flag = " !" if ec is not None and ec > 0.8 else ""
+        A("| {} | {} | {} | {} | {}{} | {} | {} | **{:.3f}** | {} | {} |".format(
+            m["name"], ref["label"] if ref else src, e.get("n_members", "-"),
+            e.get("combine_mode", "-"),
+            f"{ec:.3f}" if ec is not None else "-", flag,
+            f"{e['disagreement']*100:.1f}%" if e.get("disagreement") is not None else "-",
+            f"{e['best_member_pi']:.3f}" if e.get("best_member_pi") is not None else "-",
+            m["pi_bits"],
+            f"{e['gain_ratio']:.3f}x" if e.get("gain_ratio") is not None else "-",
+            f"{m['predicted_traces']:.1f}" if np.isfinite(m["predicted_traces"]) else "무한"))
+    A("")
+    A("`!` 표시는 오차 상관이 0.8을 넘어 멤버들이 사실상 같은 모델이라는 뜻이다.")
+    A("")
+    A("**참고: 다양성 원천별 실측 기준값** (선형 프로브, 실제 트레이스 600+600개)\n")
+    A("| 원천 | 오차 상관 | 앙상블 이득 |")
+    A("|---|---|---|")
+    for k, v in DIVERSITY_REFERENCE.items():
+        if k == "single":
+            continue
+        A(f"| {v['label']} | {v['error_corr'] if v['error_corr'] is not None else '-'} "
+          f"| {v['gain']:.3f}x |")
+    A("")
+    A("중첩 창(폭만 다른 창)은 넓은 창이 좁은 창을 포함해 우열 관계가 되므로")
+    A("멤버로 부적합하다. 폭 확대는 단일 모델의 기본 설정으로 쓴다.")
+    A("선형 프로브 기준이라 신경망 앙상블 이득은 이보다 클 수 있다.")
     return "\n".join(L)
 
 
@@ -229,6 +339,8 @@ def render_benchmark(out_path, metrics_list, notes=""):
     A("키 공간이 23.0비트이므로 `필요 트레이스 = 23.0 / PI`로 예측한다.\n")
     A("## 성능\n")
     A(comparison_table(metrics_list))
+    A("\n## 앙상블 다양성\n")
+    A(ensemble_table(metrics_list))
     A("\n## 학습 비용 대비 효율\n")
     A(efficiency_table(metrics_list))
     A("\n## 참고: 완벽 오라클 기준선\n")

@@ -392,13 +392,32 @@ PI가 낮으면 채택하지 않는다.
 ```python
 import v3_benchmark as bm
 
+# 단일 모델
 v = bm.Variant("멀티태스크 w96", "sign+byte0~2, window=96", scheme="multitask", window=96)
 m = bm.evaluate_variant(v, probs, y_atk, n_params=model.count_params(),
                         train_seconds=elapsed, train_samples=train.samples_per_epoch(),
                         sr100=attack["traces_to_sr100"], oracle_sr100=6)
 all_metrics.append(m)
+
+# 앙상블은 멤버 확률 리스트를 넘긴다. 다양성과 이득이 자동으로 채워진다.
+ve = bm.Variant("앙상블 넓은창+disjoint", "", window=128,
+                ensemble={"source": "mixed"})     # bagging|nested|disjoint|mixed|snapshot
+me = bm.evaluate_ensemble_variant(ve, [p[atk] for p in member_probs], y_atk[atk],
+                                  ens.mode, ens.weights,
+                                  n_params=sum(m.count_params() for m, _ in members),
+                                  train_seconds=elapsed_all)
+all_metrics.append(me)
+
 bm.render_benchmark(f"{WORK}/benchmark.md", all_metrics)
 ```
+
+리포트에는 **앙상블 다양성 표**가 별도로 들어간다(다양성 원천, 멤버 수, 결합 방식,
+오차 상관, 불일치율, 최고 멤버 PI 대비 이득). 오차 상관이 0.8을 넘으면 `!`가 붙는데,
+멤버들이 사실상 같은 모델이라는 뜻이므로 구성을 바꾼다.
+
+`ensemble={"source": ...}`에 원천을 적어두면 `DIVERSITY_REFERENCE`의 실측 기준값
+(배깅 1.003x / 중첩창 1.018x / disjoint 1.195x / 넓은창+disjoint 1.108x)과
+나란히 비교된다.
 
 **해석**
 - `pi_bits`: 트레이스 하나에서 실제로 뽑아낸 정보량. 클수록 좋다.
