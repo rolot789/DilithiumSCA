@@ -27,7 +27,10 @@ H(Y)는 라벨의 엔트로피(라벨이 원래 담고 있는 정보량), 뒤 �
     바이트별 HW 4개      10.83 비트  ->   3개 필요
 """
 
+import json
+import os
 import time
+from datetime import datetime
 
 import numpy as np
 
@@ -76,6 +79,18 @@ SCHEMES = {
 
 MULTITASK_HEADS = ["sign", "byte0", "byte1", "byte2"]
 
+# ---------------------------------------------------------------------------
+# 두 종류의 기준값을 구분한다. 섞으면 갱신할 때 사고가 난다.
+#
+#   MULTITASK_REFERENCE (아래, 상수)
+#       라벨 자체의 엔트로피. u 분포의 성질이라 **모델과 무관**하다.
+#       CNN을 학습해도 바뀌지 않으므로 상수로 못박는다.
+#
+#   head_baseline.json (아래 load/record 함수)
+#       헤드별 PI, 한계 기여, 선택된 헤드. **모델에 따라 달라진다.**
+#       현재는 선형 프로브로 잰 값이 들어 있고, CNN 결과가 나오면 교체된다.
+# ---------------------------------------------------------------------------
+
 # 멀티태스크 기준값. 공격셋 u 전량(10,240,000 샘플)으로 실측했다.
 #
 # 주변 엔트로피의 단순 합(8.7853)은 헤드가 완전히 독립일 때만 성립하는 상한이다.
@@ -117,6 +132,77 @@ def perceived_information(probs, y_true, n_classes=None):
     nll_bits = float(-np.mean(np.log2(probs[np.arange(len(y)), y])))
     return {"pi": h - nll_bits, "entropy": h, "nll_bits": nll_bits,
             "pi_ratio": (h - nll_bits) / h if h > 0 else 0.0}
+
+
+HEAD_BASELINE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  "head_baseline.json")
+
+
+def load_head_baseline(path=None):
+    """모델 의존적인 헤드 기준값을 읽는다. 없으면 None."""
+    p = path or HEAD_BASELINE_PATH
+    if not os.path.exists(p):
+        return None
+    with open(p) as f:
+        return json.load(f)
+
+
+def record_head_baseline(source, per_head, chosen_heads, combos=None,
+                         notes="", path=None, model_info=None):
+    """헤드 기준값을 갱신한다. **CNN 학습 결과가 나오면 이 함수를 호출한다.**
+
+    source     : "linear_probe" | "cnn" 등 무엇으로 잰 값인지
+    per_head   : {헤드: {"top1":…, "pi_standalone":…, "marginal":…}}
+    chosen_heads: select_heads()가 고른 헤드 목록
+    combos     : [{"heads":[…], "pi":…, "predicted_traces":…}, …] (선택)
+
+    이전 기준값은 `history`에 쌓이므로 선형 프로브 -> CNN 변화를 추적할 수 있다.
+    라벨 엔트로피(MULTITASK_REFERENCE)는 여기서 건드리지 않는다. 모델과 무관하기 때문이다.
+    """
+    p = path or HEAD_BASELINE_PATH
+    prev = load_head_baseline(p)
+    payload = {
+        "source": source,
+        "recorded_at": datetime.now().isoformat(timespec="seconds"),
+        "per_head": per_head,
+        "chosen_heads": list(chosen_heads),
+        "combos": combos or [],
+        "notes": notes,
+        "model_info": model_info or {},
+        "history": (prev.get("history", []) + [{
+            k: prev[k] for k in ("source", "recorded_at", "per_head",
+                                 "chosen_heads", "combos", "notes")
+            if k in prev}]) if prev else [],
+    }
+    with open(p, "w") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+    return p
+
+
+def baseline_from_ablation(source, head_probs, head_labels, head_names=None,
+                           model_info=None, notes="", path=None):
+    """한 번의 호출로 한계 기여를 계산하고 기준값까지 기록한다.
+
+    Step 6-e 끝에서 이것만 호출하면 된다. **캘리브레이션셋 확률을 넘길 것.**
+    """
+    names = list(head_names or head_probs.keys())
+    info = multitask_perceived_information(head_probs, head_labels, names)
+    abl = head_ablation(head_probs, head_labels, names)
+    per_head = {}
+    for h in names:
+        d = info["per_head"][h]
+        a = abl["heads"].get(h) or {}
+        per_head[h] = {"top1": d["top1"], "pi_standalone": d["pi"],
+                       "marginal": a.get("marginal"),
+                       "drop_is_better": a.get("drop_is_better")}
+    chosen = select_heads(head_probs, head_labels, names, verbose=False)
+    combos = [{"heads": chosen["heads"], "pi": chosen["pi"],
+               "predicted_traces": traces_to_recovery(chosen["pi"])}]
+    if chosen["heads"] != names:          # 전체 조합이 곧 선택이면 중복이다
+        combos.append({"heads": names, "pi": info["pi"],
+                       "predicted_traces": traces_to_recovery(info["pi"])})
+    return record_head_baseline(source, per_head, chosen["heads"], combos,
+                                notes=notes, path=path, model_info=model_info)
 
 
 def joint_entropy(head_labels, head_names=None):
@@ -584,30 +670,47 @@ def multitask_table(metrics_list):
     A("(실측에서 bit24/bit28/bit31의 |rho|가 0.7238로 완전히 동일했다.)")
     A("")
     A("**주의: 상한과 실현치는 다르다.** 1.997배는 라벨이 담을 수 있는 정보량의 상한일 뿐,")
-    A("헤드마다 학습 난이도가 크게 다르다. 선형 프로브 실측이다.\n")
-    A("| 헤드 | 누설 \\|rho\\| | H(Y_h) | 실측 PI_h(단독) | 비고 |")
-    A("|---|---|---|---|---|")
-    A("| sign | 0.72 | 1.000 | **+0.660** | 쉽게 학습됨 (Top-1 91%) |")
-    A("| byte2 | 0.57 | 2.692 | +0.241 | 단독은 양수지만 sign과 0.37비트 겹침 |")
-    A("| byte1 | 0.29 | 2.550 | -0.039 | 학습 실패 |")
-    A("| byte0 | 0.24 | 2.543 | -0.043 | 학습 실패 |")
-    A("")
-    A("헤드 조합별 결합 PI(앙상블, 헤드별 가중치)를 실측하면 **헤드가 적을수록 좋았다.**\n")
-    A("| 헤드 조합 | H(결합) | 결합 PI | 예측 트레이스 |")
-    A("|---|---|---|---|")
-    A("| **sign 단독** | 1.000 | **0.660** | **34.8** |")
-    A("| sign + byte2 | 3.326 | 0.535 | 43.0 |")
-    A("| sign + byte1 + byte2 | 5.874 | 0.494 | 46.5 |")
-    A("| sign + byte0~2 (기본 4헤드) | 8.403 | 0.436 | 52.7 |")
-    A("| (비교) HW 단독 라벨 | 4.211 | 0.401 | 57.4 |")
-    A("")
-    A("byte2는 단독 PI_h가 +0.241로 양수인데도 넣으면 손해다. 결합 엔트로피를")
-    A("+2.326만 올리면서 NLL은 2.452를 더하기 때문이다(sign과 0.366비트 중복).")
-    A("**그래서 헤드 선택은 단독 PI_h가 아니라 한계 기여로 해야 한다.**")
-    A("`select_heads()`가 캘리브레이션셋에서 이를 탐욕적으로 수행한다.")
-    A("")
-    A("이 결과는 선형 프로브 기준이다. 약한 바이트를 학습해내는 강한 CNN이라면")
-    A("결론이 달라질 수 있으므로, 실기에서 `head_ablation()`으로 직접 확인할 것.")
+    A("헤드마다 학습 난이도가 크게 다르다.\n")
+
+    base = load_head_baseline()
+    if base:
+        src = base.get("source", "?")
+        tag = {"linear_probe": "선형 프로브", "cnn": "CNN"}.get(src, src)
+        A(f"**기준값 출처: {tag}** (기록 {base.get('recorded_at', '?')})\n")
+        A("| 헤드 | Top-1 | PI_h(단독) | 한계 기여 | 판정 |")
+        A("|---|---|---|---|---|")
+        for h, d in base.get("per_head", {}).items():
+            marg = d.get("marginal")
+            A("| {} | {} | {} | {} | {} |".format(
+                h,
+                f"{d['top1']*100:.2f}%" if d.get("top1") is not None else "-",
+                f"{d['pi_standalone']:+.3f}" if d.get("pi_standalone") is not None else "-",
+                f"**{marg:+.3f}**" if marg is not None else "-",
+                "빼는 게 이득" if d.get("drop_is_better") else "유지"))
+        A("")
+        if base.get("combos"):
+            A("| 헤드 조합 | 결합 PI | 예측 트레이스 |")
+            A("|---|---|---|")
+            for c in base["combos"]:
+                pt = c.get("predicted_traces")
+                pt_s = f"{pt:.1f}" if pt is not None and np.isfinite(pt) else "무한"
+                A("| {} | {:.3f} | {} |".format("+".join(c["heads"]), c["pi"], pt_s))
+            A("")
+        A(f"선택된 헤드: **{'+'.join(base.get('chosen_heads', [])) or '-'}**")
+        if base.get("notes"):
+            A(f"\n{base['notes']}")
+        if src == "linear_probe":
+            A("")
+            A("**이 값은 선형 프로브 기준이다.** 약한 바이트를 학습해내는 강한 CNN이라면")
+            A("결론이 달라진다. Step 6-e에서 `baseline_from_ablation('cnn', ...)`을 호출해")
+            A("CNN 실측치로 교체할 것.")
+        A("")
+    else:
+        A("_헤드 기준값 미기록. `baseline_from_ablation()`으로 기록할 것._\n")
+
+    A("헤드 선택은 **단독 PI_h가 아니라 한계 기여**로 한다. 헤드끼리 정보가 겹치면")
+    A("단독 PI가 양수여도 결합에 넣었을 때 손해일 수 있다(선형 프로브에서 byte2가")
+    A("단독 +0.241, 한계 -0.140이었다). `select_heads()`가 캘리브레이션셋에서 수행한다.")
     return "\n".join(L)
 
 

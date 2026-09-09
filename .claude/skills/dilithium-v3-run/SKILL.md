@@ -559,9 +559,36 @@ bm.evaluate_multitask_variant(v, {h: head_probs[h][atk] for h in hs},
   쓸 이유가 없으므로 HW 단독으로 돌아간다.
 - 결과를 `evaluate_multitask_variant`로 벤치마크에 올려 다른 방식과 함께 기록
 
-**결과를 기록할 것.** 선형 프로브 기준선을 CNN 실측치로 갱신해야 이후 실험의
-기준이 된다. 갱신 대상은 `instruction_v3.md` 10.3절과
-`v3_benchmark.MULTITASK_REFERENCE`다.
+#### 결과 기록 (이 단계의 마지막, 건너뛰지 말 것)
+
+```python
+bm.baseline_from_ablation(
+    "cnn",
+    {h: p[cal] for h, p in head_probs.items()},     # 캘리브레이션셋 확률
+    {h: y[cal] for h, y in head_labels.items()},
+    model_info={"window": WINDOW, "window_offset": OFFSET,
+                "params": mt.count_params(), "epochs": len(history.history["loss"])},
+    notes="여기에 관찰한 것을 적는다 (예: byte0 학습 성공 여부)")
+```
+
+한 번 호출하면 한계 기여 계산, 헤드 선택, 파일 기록이 모두 끝난다.
+`project v3/head_baseline.json`이 갱신되고 **이전 값은 `history`에 보존**되므로
+선형 프로브 -> CNN 변화를 추적할 수 있다. 이후 모든 리포트의
+"멀티태스크 헤드 분해" 표가 자동으로 CNN 기준값을 쓴다.
+
+**갱신 대상을 혼동하지 말 것.**
+
+| 대상 | 성격 | CNN 결과로 갱신? |
+|---|---|---|
+| `head_baseline.json` | 헤드별 PI / 한계 기여 / 선택된 헤드 | **갱신한다** |
+| `v3_benchmark.MULTITASK_REFERENCE` | 라벨 자체의 엔트로피 | **갱신하지 않는다** |
+
+`MULTITASK_REFERENCE`의 값(결합 엔트로피 8.4157, HW 4.2147 등)은 `u` 분포의
+성질을 1,024만 샘플로 잰 것이라 **모델과 무관하다.** 어떤 CNN을 학습해도 바뀌지
+않으므로 건드리지 않는다. 여기를 고치려 든다면 무언가 잘못 이해한 것이다.
+
+`instruction_v3.md` 10.3절의 표도 CNN 결과로 갱신할 것. 그쪽은 사람이 읽는
+문서라 자동 갱신되지 않는다.
 
 ---
 
