@@ -148,7 +148,7 @@ def load_head_baseline(path=None):
 
 
 def record_head_baseline(source, per_head, chosen_heads, combos=None,
-                         notes="", path=None, model_info=None):
+                         notes="", path=None, model_info=None, sync=True):
     """헤드 기준값을 갱신한다. **CNN 학습 결과가 나오면 이 함수를 호출한다.**
 
     source     : "linear_probe" | "cnn" 등 무엇으로 잰 값인지
@@ -176,7 +176,87 @@ def record_head_baseline(source, per_head, chosen_heads, combos=None,
     }
     with open(p, "w") as f:
         json.dump(payload, f, indent=2, ensure_ascii=False)
+    if sync and path is None:      # 임시 경로로 쓴 경우엔 문서를 건드리지 않는다
+        sync_docs(baseline=payload, verbose=False)
     return p
+
+
+AUTO_BLOCK_START = "<!-- AUTO:head-baseline:start -->"
+AUTO_BLOCK_END = "<!-- AUTO:head-baseline:end -->"
+
+DOC_TARGETS = [os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "instruction_v3.md")]
+
+
+def render_head_baseline_md(baseline=None):
+    """head_baseline.json을 사람이 읽는 마크다운 블록으로 만든다."""
+    b = baseline or load_head_baseline()
+    if not b:
+        return "_헤드 기준값 미기록. `baseline_from_ablation()`으로 기록할 것._"
+    src = b.get("source", "?")
+    tag = {"linear_probe": "선형 프로브", "cnn": "CNN"}.get(src, src)
+    L = [f"**측정 출처: {tag}** (기록 {b.get('recorded_at', '?')})"]
+    mi = b.get("model_info") or {}
+    if mi:
+        L.append("")
+        L.append("- " + ", ".join(f"{k}={v}" for k, v in mi.items()))
+    L += ["", "| 헤드 | Top-1 | PI_h(단독) | 한계 기여 | 판정 |",
+          "|---|---|---|---|---|"]
+    for h, d in b.get("per_head", {}).items():
+        marg = d.get("marginal")
+        L.append("| {} | {} | {} | {} | {} |".format(
+            h,
+            f"{d['top1']*100:.2f}%" if d.get("top1") is not None else "-",
+            f"{d['pi_standalone']:+.3f}" if d.get("pi_standalone") is not None else "-",
+            f"**{marg:+.3f}**" if marg is not None else "-",
+            "**빼는 게 이득**" if d.get("drop_is_better") else "유지"))
+    if b.get("combos"):
+        L += ["", "| 헤드 조합 | 결합 PI | 예측 트레이스 |", "|---|---|---|"]
+        for c in b["combos"]:
+            pt = c.get("predicted_traces")
+            pt_s = f"{pt:.1f}" if pt is not None and np.isfinite(pt) else "무한"
+            L.append("| {} | {:.3f} | {} |".format("+".join(c["heads"]),
+                                                   c["pi"], pt_s))
+    L += ["", f"**선택된 헤드: {'+'.join(b.get('chosen_heads', [])) or '-'}**"]
+    if b.get("notes"):
+        L += ["", b["notes"]]
+    if src == "linear_probe":
+        L += ["", "**이 값은 선형 프로브 기준이다.** 약한 바이트를 학습해내는 강한 "
+                  "CNN이라면 결론이 달라진다. 스킬 Step 6-e에서 "
+                  "`baseline_from_ablation('cnn', ...)`을 호출하면 이 블록이 "
+                  "CNN 실측치로 자동 교체된다."]
+    return "\n".join(L)
+
+
+def sync_docs(paths=None, baseline=None, verbose=True):
+    """문서의 AUTO 블록을 현재 기준값으로 다시 쓴다.
+
+    마커(`AUTO:head-baseline:start`/`end`) 사이만 교체하므로 손으로 쓴 설명은
+    보존된다. 마커가 없는 파일은 건너뛴다.
+    """
+    block = render_head_baseline_md(baseline)
+    updated = []
+    for p in (paths or DOC_TARGETS):
+        if not os.path.exists(p):
+            continue
+        with open(p) as f:
+            txt = f.read()
+        i, j = txt.find(AUTO_BLOCK_START), txt.find(AUTO_BLOCK_END)
+        if i < 0 or j < 0 or j < i:
+            if verbose:
+                print(f"  건너뜀(마커 없음): {p}")
+            continue
+        new = (txt[:i + len(AUTO_BLOCK_START)] + "\n\n" + block + "\n\n"
+               + txt[j:])
+        if new != txt:
+            with open(p, "w") as f:
+                f.write(new)
+            updated.append(p)
+            if verbose:
+                print(f"  갱신: {p}")
+        elif verbose:
+            print(f"  변경 없음: {p}")
+    return updated
 
 
 def baseline_from_ablation(source, head_probs, head_labels, head_names=None,
