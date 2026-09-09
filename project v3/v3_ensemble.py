@@ -93,6 +93,65 @@ def fit_ensemble_weights(prob_list, y_cal, n_iter=200, tol=1e-8):
     return w
 
 
+def combine_multitask(member_head_probs, mode="mean", per_head_weights=None):
+    """멀티태스크 멤버들을 **헤드별로** 결합한다.
+
+    member_head_probs: [{헤드: (n, C_h) 확률}, ...]
+
+    헤드마다 따로 결합하는 이유: 멤버마다 잘하는 헤드가 다르다. sign은 잘 맞히지만
+    byte0은 못 맞히는 멤버가 있을 수 있고, 그럴 때 하나의 공통 가중치를 쓰면
+    한쪽을 망친다.
+    """
+    heads = list(member_head_probs[0].keys())
+    out = {}
+    for h in heads:
+        w = (per_head_weights or {}).get(h)
+        out[h] = combine_probs([m[h] for m in member_head_probs], mode, w)
+    return out
+
+
+def fit_multitask_weights(member_head_probs, head_labels_cal):
+    """헤드별 혼합 가중치를 캘리브레이션셋에서 각각 학습한다."""
+    heads = list(member_head_probs[0].keys())
+    return {h: fit_ensemble_weights([m[h] for m in member_head_probs],
+                                    head_labels_cal[h]) for h in heads}
+
+
+def select_combine_mode_multitask(member_head_probs, head_labels_cal, joint_h=None):
+    """결합 방식을 헤드 전체의 합산 PI 기준으로 고른다. 공격셋은 쓰지 않는다."""
+    from v3_benchmark import multitask_perceived_information
+
+    best = None
+    for mode in ("mean", "logmean", "weighted"):
+        w = fit_multitask_weights(member_head_probs, head_labels_cal) \
+            if mode == "weighted" else None
+        comb = combine_multitask(member_head_probs, mode, w)
+        pi = multitask_perceived_information(comb, head_labels_cal,
+                                             joint_h=joint_h)["pi"]
+        if best is None or pi > best[1]:
+            best = (mode, pi, w)
+    return {"mode": best[0], "cal_pi": best[1], "per_head_weights": best[2]}
+
+
+def diversity_report_multitask(member_head_probs, head_labels, verbose=True):
+    """헤드별 다양성. 어떤 헤드에서 멤버들이 실제로 다른지 본다."""
+    heads = list(member_head_probs[0].keys())
+    per_head = {}
+    for h in heads:
+        per_head[h] = diversity_report([m[h] for m in member_head_probs],
+                                       head_labels[h], verbose=False)
+    ec = [v["mean_error_correlation"] for v in per_head.values()]
+    dis = [v["mean_disagreement"] for v in per_head.values()]
+    rep = {"n_members": len(member_head_probs), "per_head": per_head,
+           "mean_error_correlation": float(np.mean(ec)),
+           "mean_disagreement": float(np.mean(dis))}
+    if verbose:
+        for h, v in per_head.items():
+            print(f"    {h:6s} 오차 상관 {v['mean_error_correlation']:.3f}, "
+                  f"불일치 {v['mean_disagreement']*100:.1f}%")
+    return rep
+
+
 def select_combine_mode(prob_list, y_cal, weights=None):
     """캘리브레이션셋 PI가 가장 높은 결합 방식을 고른다. 공격셋은 쓰지 않는다."""
     best = None

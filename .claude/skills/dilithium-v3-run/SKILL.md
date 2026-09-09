@@ -422,11 +422,40 @@ mm = bm.evaluate_multitask_variant(vm_, head_probs, head_labels,
 all_metrics.append(mm)
 ```
 
-리포트의 **멀티태스크 헤드 분해 표**에서 헤드별 PI_h를 확인한다.
-**PI_h가 음수인 헤드는 정보를 뺏고 있으므로** `compile_multitask(loss_weights=...)`
-에서 가중치를 낮추거나 뺀다. 선형 프로브 기준 byte0/byte1이 음수였다
-(누설 |rho| 0.24~0.29로 가장 약함). 결합 엔트로피 8.416비트 중 5.09비트가
-이 두 헤드에 몰려 있으므로, 멀티태스크 이득은 사실상 여기서 갈린다.
+**헤드 선택은 단독 PI_h가 아니라 한계 기여로 한다.** 헤드끼리 정보가 겹치면
+단독 PI가 양수여도 넣으면 손해일 수 있다. 실측 예: `byte2`는 단독 PI_h가
++0.241인데 한계 기여는 **-0.140**이다(sign과 0.366비트 중복).
+
+```python
+# 반드시 캘리브레이션셋에서. 공격셋으로 고르면 테스트셋 튜닝이다.
+chosen = bm.select_heads(head_probs_cal, head_labels_cal)
+print(chosen["heads"])            # 예: ['sign']
+print(bm.head_ablation(head_probs_cal, head_labels_cal))
+```
+
+선형 프로브 실측에서는 **헤드가 적을수록 좋았다.**
+
+| 헤드 조합 | 결합 PI | 예측 트레이스 |
+|---|---|---|
+| **sign 단독** | **0.660** | **34.8** |
+| sign+byte2 | 0.535 | 43.0 |
+| sign+byte0~2 (4헤드) | 0.436 | 52.7 |
+| (비교) HW 단독 라벨 | 0.401 | 57.4 |
+
+byte0/byte1은 누설이 가장 약해(|rho| 0.24~0.29) 학습에 실패했다. 결합 엔트로피
+8.416비트 중 5.09비트가 이 둘에 몰려 있으므로 멀티태스크 이득은 여기서 갈린다.
+강한 CNN이 이를 학습해내면 결론이 달라질 수 있으니 반드시 직접 확인한다.
+제외할 헤드는 `compile_multitask(loss_weights=...)`에서 가중치를 낮추거나 뺀다.
+
+**앙상블을 멀티태스크로 구성할 때**는 헤드별로 결합한다. 멤버마다 잘하는 헤드가
+다르기 때문이다(실측: sign은 넓은 창 멤버에 가중치 0.966이 몰렸지만,
+byte0은 [0.348, 0.085, 0.229, 0.274, 0.064]로 disjoint 멤버들에 퍼졌다).
+
+```python
+sel = en.select_combine_mode_multitask(member_head_probs_cal, head_labels_cal)
+mm = bm.evaluate_multitask_ensemble_variant(v, member_head_probs_atk, head_labels_atk,
+                                            sel["mode"], sel["per_head_weights"])
+```
 
 리포트에는 **앙상블 다양성 표**도 별도로 들어간다(다양성 원천, 멤버 수, 결합 방식,
 오차 상관, 불일치율, 최고 멤버 PI 대비 이득). 오차 상관이 0.8을 넘으면 `!`가 붙는데,

@@ -164,6 +164,64 @@ def multitask_perceived_information(head_probs, head_labels, head_names=None,
             "marginal_sum": marg, "redundancy": marg - H, "per_head": per_head}
 
 
+def head_ablation(head_probs, head_labels, head_names=None):
+    """헤드를 하나씩 빼보며 결합 PI가 얼마나 떨어지는지 잰다.
+
+    **헤드 선택은 PI_h(단독)가 아니라 이 한계 기여도로 해야 한다.**
+
+    PI_h(단독) = H(Y_h) - NLL_h 는 그 헤드만 봤을 때의 정보량이다. 그런데 결합
+    PI에 대한 실제 기여는 `ΔH(결합) - NLL_h` 이고, 헤드끼리 겹치면 ΔH가 H(Y_h)보다
+    작아져 부호가 뒤집힐 수 있다.
+
+    실측 예 (선형 프로브): byte2는 PI_h = +0.241로 양수지만, 결합에 넣으면
+    H(결합)을 +2.326만 올리는데 NLL은 2.452를 더해 한계 기여가 **-0.126**이다.
+    sign과 0.366비트 겹치기 때문이다. 실제로 byte2를 빼면 PI가 0.535에서
+    0.660으로 올랐다.
+
+    반환: {헤드: 그 헤드를 뺐을 때의 PI 변화}. **양수면 빼는 게 이득**이다.
+    """
+    names = list(head_names or head_probs.keys())
+    full = multitask_perceived_information(head_probs, head_labels, names)["pi"]
+    out = {}
+    for h in names:
+        rest = [n for n in names if n != h]
+        if not rest:
+            out[h] = None
+            continue
+        sub = multitask_perceived_information(
+            {n: head_probs[n] for n in rest},
+            {n: head_labels[n] for n in rest}, rest)["pi"]
+        out[h] = {"pi_without": sub, "marginal": full - sub,
+                  "drop_is_better": sub > full}
+    return {"full_pi": full, "heads": out}
+
+
+def select_heads(head_probs, head_labels, head_names=None, verbose=True):
+    """결합 PI가 가장 높은 헤드 부분집합을 탐욕적으로 고른다.
+
+    한계 기여가 음수인 헤드를 하나씩 제거하며, 더 이상 개선되지 않으면 멈춘다.
+    반드시 **캘리브레이션셋**에서 호출할 것. 공격셋으로 고르면 테스트셋 튜닝이 된다.
+    """
+    names = list(head_names or head_probs.keys())
+    best_pi = multitask_perceived_information(head_probs, head_labels, names)["pi"]
+    while len(names) > 1:
+        cand = None
+        for h in names:
+            rest = [n for n in names if n != h]
+            pi = multitask_perceived_information(
+                {n: head_probs[n] for n in rest},
+                {n: head_labels[n] for n in rest}, rest)["pi"]
+            if pi > best_pi and (cand is None or pi > cand[1]):
+                cand = (h, pi)
+        if cand is None:
+            break
+        if verbose:
+            print(f"    헤드 '{cand[0]}' 제거 -> PI {best_pi:.3f} -> {cand[1]:.3f}")
+        names.remove(cand[0])
+        best_pi = cand[1]
+    return {"heads": names, "pi": best_pi}
+
+
 def traces_to_recovery(pi, key_bits=KEY_BITS):
     """PI로부터 키 복구에 필요한 트레이스 수를 예측한다."""
     if pi <= 0:
@@ -338,6 +396,8 @@ def evaluate_multitask_variant(variant, head_probs, head_labels, head_names=None
             "marginal_sum": info["marginal_sum"],
             "redundancy": info["redundancy"],
             "per_head": info["per_head"],
+            "ablation": head_ablation(head_probs, head_labels, names)
+            if len(names) > 1 else None,
         },
     }
     if sr100 and oracle_sr100:
@@ -347,6 +407,43 @@ def evaluate_multitask_variant(variant, head_probs, head_labels, head_names=None
     if variant.ensemble:
         m["ensemble"] = dict(variant.ensemble)
     variant.record(**m)
+    return m
+
+
+def evaluate_multitask_ensemble_variant(variant, member_head_probs, head_labels,
+                                        mode="mean", per_head_weights=None,
+                                        head_names=None, joint_h=None, **kw):
+    """멀티태스크 모델들로 구성한 앙상블. 헤드별로 결합한 뒤 결합 PI로 평가한다."""
+    import v3_ensemble as ve
+
+    names = head_names or list(member_head_probs[0].keys())
+    combined = ve.combine_multitask(member_head_probs, mode, per_head_weights)
+    m = evaluate_multitask_variant(variant, combined, head_labels,
+                                   head_names=names, joint_h=joint_h, **kw)
+
+    div = ve.diversity_report_multitask(member_head_probs, head_labels, verbose=False)
+    if joint_h is None and tuple(names) == MULTITASK_REFERENCE["heads"]:
+        joint_h = MULTITASK_REFERENCE["joint_entropy"]
+    member_pi = [multitask_perceived_information(mp, head_labels, names, joint_h)["pi"]
+                 for mp in member_head_probs]
+    best = max(member_pi)
+    info = dict(variant.ensemble or {})
+    info.update({
+        "n_members": len(member_head_probs),
+        "combine_mode": mode,
+        "error_correlation": div["mean_error_correlation"],
+        "disagreement": div["mean_disagreement"],
+        "member_pi": member_pi,
+        "best_member_pi": float(best),
+        "mean_member_pi": float(np.mean(member_pi)),
+        "gain_over_best": float(m["pi_bits"] - best),
+        "gain_ratio": float(m["pi_bits"] / best) if best > 0 else float("inf"),
+        "predicted_traces_best": traces_to_recovery(best),
+        "per_head_diversity": {h: v["mean_error_correlation"]
+                               for h, v in div["per_head"].items()},
+    })
+    m["ensemble"] = info
+    variant.record(ensemble=info)
     return m
 
 
@@ -446,15 +543,21 @@ def multitask_table(metrics_list):
     for m in mts:
         mt = m["multitask"]
         A(f"**{m['name']}** — 헤드 {len(mt['heads'])}개\n")
-        A("| 헤드 | H(Y_h) | NLL(비트) | PI_h | PI/H | Top-1 |")
-        A("|---|---|---|---|---|---|")
+        abl = (mt.get("ablation") or {}).get("heads", {})
+        A("| 헤드 | H(Y_h) | NLL(비트) | PI_h (단독) | **한계 기여** | 빼면? | Top-1 |")
+        A("|---|---|---|---|---|---|---|")
         for h in mt["heads"]:
             d = mt["per_head"][h]
-            note = SCHEMES[h].note if h in SCHEMES else ""
-            A(f"| {h} | {d['entropy']:.3f} | {d['nll_bits']:.3f} | "
-              f"**{d['pi']:.3f}** | {d['pi']/d['entropy']*100 if d['entropy'] else 0:.1f}% | "
-              f"{d['top1']*100:.2f}% |")
+            a = abl.get(h) or {}
+            marg = a.get("marginal")
+            A("| {} | {:.3f} | {:.3f} | {:+.3f} | {} | {} | {:.2f}% |".format(
+                h, d["entropy"], d["nll_bits"], d["pi"],
+                f"**{marg:+.3f}**" if marg is not None else "-",
+                "**빼는 게 이득**" if a.get("drop_is_better") else "유지",
+                d["top1"] * 100))
         A("")
+        A("**헤드 선택은 `PI_h(단독)`이 아니라 `한계 기여`로 한다.** 헤드끼리 정보가")
+        A("겹치면 단독 PI가 양수여도 결합에 넣었을 때 손해일 수 있다.")
         A(f"- 주변 엔트로피 합 {mt['marginal_sum']:.3f} 비트, "
           f"**결합 엔트로피 {mt['joint_entropy']:.3f} 비트**, "
           f"중복 {mt['redundancy']:.3f} 비트 "
@@ -481,18 +584,30 @@ def multitask_table(metrics_list):
     A("(실측에서 bit24/bit28/bit31의 |rho|가 0.7238로 완전히 동일했다.)")
     A("")
     A("**주의: 상한과 실현치는 다르다.** 1.997배는 라벨이 담을 수 있는 정보량의 상한일 뿐,")
-    A("헤드마다 학습 난이도가 크게 다르다. 선형 프로브 실측 PI_h는 다음과 같았다.\n")
-    A("| 헤드 | 누설 \\|rho\\| | H(Y_h) | 실측 PI_h | 비고 |")
+    A("헤드마다 학습 난이도가 크게 다르다. 선형 프로브 실측이다.\n")
+    A("| 헤드 | 누설 \\|rho\\| | H(Y_h) | 실측 PI_h(단독) | 비고 |")
     A("|---|---|---|---|---|")
-    A("| sign | 0.72 | 1.000 | **+0.643** | 쉽게 학습됨 (Top-1 91%) |")
-    A("| byte2 | 0.57 | 2.692 | +0.096 | 겨우 양수 |")
-    A("| byte1 | 0.29 | 2.550 | -0.148 | 학습 실패 |")
-    A("| byte0 | 0.24 | 2.543 | -0.149 | 학습 실패 |")
+    A("| sign | 0.72 | 1.000 | **+0.660** | 쉽게 학습됨 (Top-1 91%) |")
+    A("| byte2 | 0.57 | 2.692 | +0.241 | 단독은 양수지만 sign과 0.37비트 겹침 |")
+    A("| byte1 | 0.29 | 2.550 | -0.039 | 학습 실패 |")
+    A("| byte0 | 0.24 | 2.543 | -0.043 | 학습 실패 |")
     A("")
-    A("결합 엔트로피 8.416비트 중 **5.09비트가 byte0/byte1에 있는데 둘 다 누설이 약하다.**")
-    A("즉 멀티태스크의 이득은 '약한 바이트를 학습할 수 있는가'에 전적으로 달려 있다.")
-    A("강한 CNN이 이를 해내는지 반드시 PI_h로 헤드별 확인할 것. 특정 헤드의 PI_h가")
-    A("음수면 그 헤드는 정보를 주는 게 아니라 뺏고 있으므로 `loss_weights`에서 낮추거나 뺀다.")
+    A("헤드 조합별 결합 PI(앙상블, 헤드별 가중치)를 실측하면 **헤드가 적을수록 좋았다.**\n")
+    A("| 헤드 조합 | H(결합) | 결합 PI | 예측 트레이스 |")
+    A("|---|---|---|---|")
+    A("| **sign 단독** | 1.000 | **0.660** | **34.8** |")
+    A("| sign + byte2 | 3.326 | 0.535 | 43.0 |")
+    A("| sign + byte1 + byte2 | 5.874 | 0.494 | 46.5 |")
+    A("| sign + byte0~2 (기본 4헤드) | 8.403 | 0.436 | 52.7 |")
+    A("| (비교) HW 단독 라벨 | 4.211 | 0.401 | 57.4 |")
+    A("")
+    A("byte2는 단독 PI_h가 +0.241로 양수인데도 넣으면 손해다. 결합 엔트로피를")
+    A("+2.326만 올리면서 NLL은 2.452를 더하기 때문이다(sign과 0.366비트 중복).")
+    A("**그래서 헤드 선택은 단독 PI_h가 아니라 한계 기여로 해야 한다.**")
+    A("`select_heads()`가 캘리브레이션셋에서 이를 탐욕적으로 수행한다.")
+    A("")
+    A("이 결과는 선형 프로브 기준이다. 약한 바이트를 학습해내는 강한 CNN이라면")
+    A("결론이 달라질 수 있으므로, 실기에서 `head_ablation()`으로 직접 확인할 것.")
     return "\n".join(L)
 
 
