@@ -184,8 +184,9 @@ def record_head_baseline(source, per_head, chosen_heads, combos=None,
 AUTO_BLOCK_START = "<!-- AUTO:head-baseline:start -->"
 AUTO_BLOCK_END = "<!-- AUTO:head-baseline:end -->"
 
-DOC_TARGETS = [os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                            "instruction_v3.md")]
+_HERE = os.path.dirname(os.path.abspath(__file__))
+DOC_TARGETS = [os.path.join(_HERE, "instruction_v3.md"),
+               os.path.join(_HERE, "README.md")]
 
 
 def render_head_baseline_md(baseline=None):
