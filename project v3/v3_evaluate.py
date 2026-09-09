@@ -20,6 +20,8 @@ import numpy as np
 
 from v3_common import N_HW_CLASSES, Q, hw32, mr
 
+KEY_BITS = float(np.log2(Q))     # 23.0 — 계수 하나를 특정하는 데 필요한 정보량
+
 
 def centered_residue(x):
     """s를 (-q/2, q/2] 대표원으로. 실측상 [0,q) 대표원보다 불일치가 적다."""
@@ -161,6 +163,70 @@ def perfect_oracle_curve(u_true, c_vals, coeff_k, poly_j, cands, true_idx,
         cum = np.cumsum(np.log(np.clip(match, 1e-12, 1.0)), axis=0)
         ranks[e] = _mid_rank(cum, true_idx)
     return ranks.mean(axis=0), (ranks == 0).mean(axis=0)
+
+
+def full_key_metrics(per_coeff_pi, key_bits=None, n_coefficients=1024,
+                     trace_grid=None, verbose=True):
+    """전체 키(1024계수) 복구 지표. **계수 하나만 재면 난이도를 과소평가한다.**
+
+    비밀키는 계수 1024개가 **전부** 복구되어야 완성이다. 계수마다 누설 강도가
+    다르므로 전체 복구 시점은 **가장 약한 계수**가 결정한다.
+
+    실측(선형 프로브, 계수 256개 표본)에서 계수별 PI는 다음과 같이 퍼져 있었다.
+        중앙값 0.956   p5 0.479   최소 -0.070(복구 불가)
+    필요 트레이스로 환산하면 중앙값 24개인데 p5는 48개, 최악은 무한대다.
+
+    더구나 누설이 계수 인덱스 k에 따라 **물리적으로 약해진다**(|rho| 0.721 -> 0.611).
+    파형 모양은 그대로이고 간격도 일정하므로 모델이나 매핑 문제가 아니라 측정
+    구간 후반의 신호 감쇠다. v2와 v3가 평가에 써온 poly0/coeff50은 강한 구간이라
+    **단일 계수 수치는 전체 키 기준으로 낙관 편향**이다.
+
+    per_coeff_pi : 계수별 PI 배열(표본이어도 된다). 전체 1024개로 외삽한다.
+    반환         : 트레이스 수별 미복구 계수 기대값과 전체 복구 지점
+    """
+    pi = np.asarray(per_coeff_pi, dtype=np.float64)
+    kb = key_bits if key_bits is not None else KEY_BITS
+    need = np.where(pi > 0, kb / np.maximum(pi, 1e-12), np.inf)
+    scale = n_coefficients / len(pi)          # 표본 -> 전체 외삽 배율
+
+    if trace_grid is None:
+        finite = need[np.isfinite(need)]
+        hi = np.percentile(finite, 99) * 2 if len(finite) else 100
+        trace_grid = np.unique(np.round(np.geomspace(5, max(hi, 20), 20)).astype(int))
+
+    curve = []
+    for n in trace_grid:
+        unrec = float((need > n).sum() * scale)
+        curve.append({"n_traces": int(n), "unrecovered": unrec,
+                      "recovered_fraction": 1.0 - unrec / n_coefficients})
+
+    rep = {
+        "n_coefficients": n_coefficients,
+        "n_sampled": len(pi),
+        "pi_median": float(np.median(pi)),
+        "pi_p5": float(np.percentile(pi, 5)),
+        "pi_min": float(pi.min()),
+        "n_unrecoverable_sampled": int((pi <= 0).sum()),
+        "traces_median_coeff": float(np.median(need[np.isfinite(need)]))
+        if np.isfinite(need).any() else float("inf"),
+        "traces_p95_coeff": float(np.percentile(need[np.isfinite(need)], 95))
+        if np.isfinite(need).any() else float("inf"),
+        "traces_full_key": float(need.max()),
+        "curve": curve,
+    }
+    if verbose:
+        print(f"  계수별 PI: 중앙값 {rep['pi_median']:.3f}, p5 {rep['pi_p5']:.3f}, "
+              f"최소 {rep['pi_min']:.3f}")
+        print(f"  필요 트레이스: 중앙값 계수 {rep['traces_median_coeff']:.0f}, "
+              f"p95 계수 {rep['traces_p95_coeff']:.0f}")
+        if np.isfinite(rep["traces_full_key"]):
+            print(f"  **전체 키 복구: {rep['traces_full_key']:.0f} 트레이스**")
+        else:
+            print(f"  **전체 키 복구 불가** — PI<=0 인 계수가 표본에 "
+                  f"{rep['n_unrecoverable_sampled']}개 있다")
+        print(f"  (단일 계수만 재면 이 값이 아니라 중앙값 쪽을 보게 되어 "
+              f"난이도를 과소평가한다)")
+    return rep
 
 
 def summarize(ge, sr, ge_full, label=""):

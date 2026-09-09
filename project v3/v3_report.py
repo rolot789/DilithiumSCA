@@ -55,17 +55,24 @@ def classification_report(probs, y_true, label=""):
 
 
 def per_coefficient_report(predict_fn, poly_coeff_pairs, verbose=True):
-    """계수별 정확도 분포. 계수 불변 모델이 정말 모든 계수에서 동작하는지 본다.
+    """계수별 정확도와 PI 분포. 계수 불변 모델이 모든 계수에서 동작하는지 본다.
 
     predict_fn(j, k) -> (probs, y_true)
-    편차가 크면 시간 매핑(time_map.json)이 일부 계수에서 어긋났다는 신호다.
+
+    **PI를 함께 재는 이유**: 전체 키는 계수 1024개가 전부 복구되어야 완성이고,
+    복구 시점은 가장 약한 계수가 결정한다. 정확도 편차만 보면 이 병목이 안 보인다.
+    반환된 `pi` 목록을 `v3_evaluate.full_key_metrics()`에 그대로 넘길 수 있다.
     """
+    from v3_benchmark import perceived_information
+
     rows = []
     for j, k in poly_coeff_pairs:
         probs, y = predict_fn(j, k)
         acc = float((np.argmax(probs, axis=1) == y).mean())
-        rows.append({"poly": int(j), "coeff": int(k), "top1": acc})
+        pi = perceived_information(probs, y)["pi"]
+        rows.append({"poly": int(j), "coeff": int(k), "top1": acc, "pi": pi})
     accs = np.array([r["top1"] for r in rows])
+    pis = np.array([r["pi"] for r in rows])
     summary = {
         "n_coefficients": len(rows),
         "mean": float(accs.mean()),
@@ -73,13 +80,24 @@ def per_coefficient_report(predict_fn, poly_coeff_pairs, verbose=True):
         "min": float(accs.min()),
         "max": float(accs.max()),
         "p05": float(np.percentile(accs, 5)),
-        "worst": sorted(rows, key=lambda r: r["top1"])[:5],
+        "pi_mean": float(pis.mean()),
+        "pi_median": float(np.median(pis)),
+        "pi_p5": float(np.percentile(pis, 5)),
+        "pi_min": float(pis.min()),
+        "n_pi_nonpositive": int((pis <= 0).sum()),
+        "pi_values": pis.tolist(),
+        "worst": sorted(rows, key=lambda r: r["pi"])[:5],
     }
     if verbose:
         print(f"  계수별 Top-1: 평균 {summary['mean']*100:.2f}% "
               f"(표준편차 {summary['std']*100:.2f}%, 최소 {summary['min']*100:.2f}%)")
+        print(f"  계수별 PI: 중앙값 {summary['pi_median']:.3f}, "
+              f"p5 {summary['pi_p5']:.3f}, 최소 {summary['pi_min']:.3f}")
+        if summary["n_pi_nonpositive"]:
+            print(f"  >> PI<=0인 계수 {summary['n_pi_nonpositive']}개. "
+                  f"그 계수는 복구 불가이므로 전체 키가 완성되지 않는다.")
         if summary["std"] > 0.05:
-            print("  >> 편차가 크다. 시간 매핑이 일부 계수에서 어긋났을 수 있다.")
+            print("  >> 정확도 편차가 크다. 시간 매핑이 일부 계수에서 어긋났을 수 있다.")
     return summary, rows
 
 
@@ -173,7 +191,7 @@ def attack_report(probs_cal, y_cal, probs_atk, c_vals_atk, coeff_k, poly_j,
 # ------------------------------------------------------------------ 리포트
 
 def render_markdown(out_path, meta, cls_val, cls_atk, calib, attack,
-                    per_coeff=None, portability=None):
+                    per_coeff=None, portability=None, full_key=None):
     """모든 결과를 하나의 마크다운 리포트로 묶는다."""
     L = []
     A = L.append
@@ -209,10 +227,39 @@ def render_markdown(out_path, meta, cls_val, cls_atk, calib, attack,
         A(f"- 계수 {per_coeff['n_coefficients']}개 표본, "
           f"평균 {per_coeff['mean']*100:.2f}%, 표준편차 {per_coeff['std']*100:.2f}%")
         A(f"- 최소 {per_coeff['min']*100:.2f}% / 최대 {per_coeff['max']*100:.2f}%")
+        if per_coeff.get("pi_median") is not None:
+            A(f"- 계수별 PI: 중앙값 {per_coeff['pi_median']:.3f}, "
+              f"p5 {per_coeff['pi_p5']:.3f}, 최소 {per_coeff['pi_min']:.3f}")
+        if per_coeff.get("n_pi_nonpositive"):
+            A(f"- **PI<=0인 계수 {per_coeff['n_pi_nonpositive']}개.** "
+              f"그 계수는 복구되지 않으므로 전체 키가 완성되지 않는다.")
         if per_coeff["std"] > 0.05:
             A("- **편차가 크다.** 시간 매핑이 일부 계수에서 어긋났을 수 있다.")
         else:
-            A("- 편차가 작다. 계수 불변 모델이 1024계수 전반에서 균일하게 동작한다.")
+            A("- 정확도 편차는 작다. 계수 불변 모델이 균일하게 동작한다.")
+        A("")
+
+    if full_key:
+        A("### 2.2 전체 키(1024계수) 복구\n")
+        A("**단일 계수 성능은 전체 키 난이도를 과소평가한다.** 비밀키는 1024개가")
+        A("전부 복구되어야 완성이고, 복구 시점은 가장 약한 계수가 결정한다.")
+        A("게다가 누설이 계수 인덱스 k에 따라 물리적으로 약해진다")
+        A("(|rho| k=0~31에서 0.721 -> k=224~255에서 0.611). v2와 v3가 평가에 써온")
+        A("poly0/coeff50은 강한 구간이라 그 수치는 낙관 편향이다.\n")
+        A(f"- 계수 {full_key['n_sampled']}개 표본 -> {full_key['n_coefficients']}개로 외삽")
+        A(f"- 필요 트레이스: 중앙값 계수 **{full_key['traces_median_coeff']:.0f}**, "
+          f"p95 계수 **{full_key['traces_p95_coeff']:.0f}**")
+        if np.isfinite(full_key["traces_full_key"]):
+            A(f"- **전체 키 복구: {full_key['traces_full_key']:.0f} 트레이스**")
+        else:
+            A(f"- **전체 키 복구 불가** — PI<=0인 계수가 표본에 "
+              f"{full_key['n_unrecoverable_sampled']}개 있다")
+        A("")
+        A("| 트레이스 수 | 미복구 계수 | 복구율 |")
+        A("|---|---|---|")
+        for c in full_key["curve"]:
+            A(f"| {c['n_traces']} | {c['unrecovered']:.0f} | "
+              f"{c['recovered_fraction']*100:.1f}% |")
         A("")
 
     A("## 3. 캘리브레이션 품질\n")
@@ -267,6 +314,11 @@ def render_markdown(out_path, meta, cls_val, cls_atk, calib, attack,
     if per_coeff:
         checks.append((per_coeff["std"] < 0.05,
                        f"계수별 표준편차 {per_coeff['std']*100:.2f}% < 5%"))
+        checks.append((not per_coeff.get("n_pi_nonpositive"),
+                       "모든 표본 계수의 PI > 0 (복구 불가 계수 없음)"))
+    if full_key:
+        checks.append((np.isfinite(full_key["traces_full_key"]),
+                       "전체 키 1024계수 복구 가능"))
     for ok, txt in checks:
         A(f"- {'[통과]' if ok else '[미달]'} {txt}")
     A("")

@@ -394,14 +394,43 @@ shape이 어긋나고, 같더라도 오프셋이 다르면 엉뚱한 구간을 �
 ### 6-1b. 계수별 편차 (계수 불변 모델의 핵심 검증)
 
 ```python
-pairs = [(j, k) for j in range(4) for k in range(0, 256, 32)]
+pairs = [(j, k) for j in range(4) for k in range(0, 256, 16)]   # 계수를 넓게 표본
 def predict_fn(j, k):
     p = vm.predict_coefficient_probs(model, atk_sampler, np.arange(2000), j, k)
     return p, vc.hw32(u_atk[:2000, j, k]).astype(np.int64)
 per_coeff, coeff_rows = rp.per_coefficient_report(predict_fn, pairs)
+
+# 전체 키(1024계수) 복구 — 단일 계수 평가는 난이도를 과소평가한다
+full_key = ev.full_key_metrics(per_coeff["pi_values"], n_coefficients=1024)
 ```
 
-**통과 조건**: 표준편차 5% 미만. 크면 시간 매핑이 일부 계수에서 어긋난 것이다.
+**계수를 k 전 구간에서 표본해야 한다.** 누설이 계수 인덱스에 따라 **물리적으로
+약해지기** 때문이다(|rho| k=0~31에서 0.721 -> k=224~255에서 0.611). 파형 모양과
+간격은 일정하므로 모델/매핑 문제가 아니라 측정 후반의 신호 감쇠다.
+
+**`POLY, COEFF = 0, 50`은 강한 구간의 계수다.** v2의 54.35%도 v3의 PI 수치도
+전체 키 관점에서는 낙관 편향이라는 뜻이다. 실측 계수별 PI 분포(선형 프로브):
+
+```
+중앙값 0.956   p5 0.479   최소 -0.070(복구 불가)
+필요 트레이스  중앙값 24개 / p95 48개 / 최악 무한대
+```
+
+**통과 조건**
+- 정확도 표준편차 5% 미만. 크면 시간 매핑이 일부 계수에서 어긋난 것이다.
+- **PI<=0인 계수가 없을 것.** 하나라도 있으면 그 계수는 복구되지 않으므로
+  전체 키가 완성되지 않는다. 리포트 판정란에 그대로 뜬다.
+
+약한 계수를 더 학습시키려면 계수 가중 샘플링을 쓴다. 강한 계수의 학습량이 주는
+대가가 있으므로 **`full_key_metrics`로 전후를 비교해 이득을 확인한 뒤에만** 채택한다.
+
+```python
+w = s2.inverse_strength_weights(quality, power=1.0)   # Step 2의 quality
+train_w = s2.CoefficientWindowSampler(Xp, hw, cm, train_idx, window=WINDOW,
+                                      window_offset=OFFSET, batch_size=512,
+                                      traces_per_batch=32, shift_aug=1, seed=0,
+                                      coeff_weights=w)
+```
 
 ### 6-2. 캘리브레이션
 
@@ -697,10 +726,12 @@ meta = {
     "실행 환경": f"{info['tf_version']}, GPU={info['gpu_devices']}",
 }
 path = rp.render_markdown(f"{WORK}/v3_report.md", meta, cls_val, cls_atk,
-                          calib, attack, per_coeff=per_coeff, portability=port)
+                          calib, attack, per_coeff=per_coeff, portability=port,
+                          full_key=full_key)
 rp.save_json(f"{WORK}/v3_report.json", {"meta": meta, "cls_atk": cls_atk,
                                         "calib": calib, "attack": attack,
-                                        "per_coeff": per_coeff, "portability": port})
+                                        "per_coeff": per_coeff, "portability": port,
+                                        "full_key": full_key})
 
 # 학습 방식을 여러 개 비교했다면 벤치마크도 함께
 bm.render_benchmark(f"{WORK}/benchmark.md", all_metrics)

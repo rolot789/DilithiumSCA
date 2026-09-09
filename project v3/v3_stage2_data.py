@@ -112,6 +112,24 @@ def build_normalized_memmap(trace_iter_factory, out_path, cfg, n_total,
     return mean, std
 
 
+def inverse_strength_weights(quality, power=1.0, floor=0.2):
+    """시간매핑 품질(|rho|)에서 계수 추출 가중치를 만든다.
+
+    누설이 약한 계수일수록 더 자주 뽑는다. 약한 계수가 전체 키 복구의 병목이기
+    때문이다. quality는 `calibrate_time_map_dense()`가 준 (L_POLY, N_COEFF) 배열.
+
+    power=0이면 균등(기존 동작), 1이면 |rho|에 반비례, 클수록 약한 계수에 집중.
+    floor는 강한 계수가 완전히 굶지 않도록 하는 하한이다.
+
+    주의: 가중치를 주면 강한 계수의 학습량이 줄어든다. **반드시 PI와
+    full_key_metrics로 전후를 비교할 것.** 전체 키 관점에서 이득이 없으면 쓰지 않는다.
+    """
+    qmean = np.asarray(quality, dtype=np.float64).mean(axis=0)   # 계수별 평균 |rho|
+    qmean = np.maximum(qmean, 1e-6)
+    w = (qmean.max() / qmean) ** power
+    return np.maximum(w / w.max(), floor)
+
+
 def set_split_indices(val_set=4, n_sets=4, n_per_set=N_PER_SET):
     """leave-one-set-out 분할. 랜덤 분할은 같은 캠페인 내부라 낙관적이다."""
     if not 1 <= val_set <= n_sets:
@@ -133,7 +151,7 @@ class CoefficientWindowSampler:
     def __init__(self, traces, hw_labels, centers, trace_indices,
                  window=64, batch_size=512, traces_per_batch=32,
                  shift_aug=0, poly_subset=None, coeff_subset=None, seed=0,
-                 window_offset=0, extra_labels=None):
+                 window_offset=0, extra_labels=None, coeff_weights=None):
         """window_offset: 윈도우 중심을 피크에서 얼마나 뒤로 밀 것인가.
 
         실측 결과 계수 하나가 **여러 지점에서 누설한다**. poly0/coeff50 기준
@@ -165,6 +183,17 @@ class CoefficientWindowSampler:
         self.coeffs = np.asarray(coeff_subset if coeff_subset is not None else range(N_COEFF))
         self.rng = np.random.default_rng(seed)
 
+        # 계수별 추출 확률. 누설이 계수 인덱스 k에 따라 물리적으로 약해지므로
+        # (|rho| k=0~31에서 0.721 -> k=224~255에서 0.611) 약한 계수가 전체 키
+        # 복구의 병목이 된다. 가중치를 주면 그쪽을 더 자주 학습하게 할 수 있다.
+        if coeff_weights is None:
+            self.coeff_p = None
+        else:
+            w = np.asarray(coeff_weights, dtype=np.float64)[self.coeffs]
+            if w.min() < 0 or w.sum() <= 0:
+                raise ValueError("coeff_weights는 음수가 없고 합이 양수여야 한다")
+            self.coeff_p = w / w.sum()
+
         half = window // 2
         lo = centers[np.ix_(self.polys, self.coeffs)] - half - shift_aug
         hi = centers[np.ix_(self.polys, self.coeffs)] + half + shift_aug
@@ -191,7 +220,7 @@ class CoefficientWindowSampler:
             for ti in trace_sel:
                 row = np.asarray(self.traces[ti], dtype=np.float32)   # 연속 읽기
                 pj = self.rng.choice(self.polys, self.per_trace)
-                pk = self.rng.choice(self.coeffs, self.per_trace)
+                pk = self.rng.choice(self.coeffs, self.per_trace, p=self.coeff_p)
                 cen = self.centers[pj, pk]
                 if self.shift_aug:
                     cen = cen + self.rng.integers(-self.shift_aug,
