@@ -411,7 +411,24 @@ all_metrics.append(me)
 bm.render_benchmark(f"{WORK}/benchmark.md", all_metrics)
 ```
 
-리포트에는 **앙상블 다양성 표**가 별도로 들어간다(다양성 원천, 멤버 수, 결합 방식,
+멀티태스크는 헤드가 여러 개라 전용 함수를 쓴다. Top-1은 **모든 헤드가 동시에
+맞은 비율**로 재어 단일 헤드 모델과 비교가 성립하게 한다.
+
+```python
+vm_ = bm.Variant("멀티태스크 w128", "sign+byte0~2", window=128)
+mm = bm.evaluate_multitask_variant(vm_, head_probs, head_labels,
+                                   n_params=model.count_params(),
+                                   train_seconds=elapsed)
+all_metrics.append(mm)
+```
+
+리포트의 **멀티태스크 헤드 분해 표**에서 헤드별 PI_h를 확인한다.
+**PI_h가 음수인 헤드는 정보를 뺏고 있으므로** `compile_multitask(loss_weights=...)`
+에서 가중치를 낮추거나 뺀다. 선형 프로브 기준 byte0/byte1이 음수였다
+(누설 |rho| 0.24~0.29로 가장 약함). 결합 엔트로피 8.416비트 중 5.09비트가
+이 두 헤드에 몰려 있으므로, 멀티태스크 이득은 사실상 여기서 갈린다.
+
+리포트에는 **앙상블 다양성 표**도 별도로 들어간다(다양성 원천, 멤버 수, 결합 방식,
 오차 상관, 불일치율, 최고 멤버 PI 대비 이득). 오차 상관이 0.8을 넘으면 `!`가 붙는데,
 멤버들이 사실상 같은 모델이라는 뜻이므로 구성을 바꾼다.
 

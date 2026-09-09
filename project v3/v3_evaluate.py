@@ -51,10 +51,12 @@ def scale_to_full_space(rank, n_candidates):
 def fit_temperature(probs_cal, y_cal, grid=None):
     """캘리브레이션셋 NLL을 최소화하는 온도. 공격셋을 절대 쓰지 않는다."""
     if grid is None:
-        # 상한을 30까지 둔다. ranking loss처럼 과신이 심한 모델은 T=10에서
-        # 그리드 경계에 닿아 보정이 덜 된 채로 통과한다.
-        grid = np.concatenate([np.linspace(0.2, 3.0, 29), np.linspace(3.2, 10.0, 35),
-                               np.linspace(10.5, 30.0, 20)])
+        # 양쪽 경계를 넉넉히 둔다. 실제로 두 번 경계에 닿았다.
+        #   ranking loss 모델(과신)  -> 상한 10에 닿음
+        #   one-vs-rest 프로브(과소확신) -> 하한 0.2에 닿음
+        # 경계에 닿으면 보정이 덜 된 채로 통과해 PI가 왜곡된다.
+        grid = np.concatenate([np.linspace(0.05, 0.95, 19), np.linspace(1.0, 3.0, 21),
+                               np.linspace(3.2, 10.0, 35), np.linspace(10.5, 30.0, 20)])
     P = np.clip(np.asarray(probs_cal, dtype=np.float64), 1e-12, 1.0)
     logp = np.log(P)
     best_t, best_nll = 1.0, np.inf

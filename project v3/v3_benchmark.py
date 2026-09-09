@@ -74,8 +74,28 @@ SCHEMES = {
                          "bit 24~31의 HW. 사실상 8 x 부호비트 (|rho| 0.72)"),
 }
 
-# 멀티태스크 학습에 쓸 헤드 조합. 바이트별 HW는 합쳐서 10.83비트로 HW 단독의 2.7배다.
 MULTITASK_HEADS = ["sign", "byte0", "byte1", "byte2"]
+
+# 멀티태스크 기준값. 공격셋 u 전량(10,240,000 샘플)으로 실측했다.
+#
+# 주변 엔트로피의 단순 합(8.7853)은 헤드가 완전히 독립일 때만 성립하는 상한이다.
+# 실제로는 헤드끼리 정보가 겹치므로 **결합 엔트로피**를 써야 한다.
+#   주변 합 8.7853 - 결합 8.4157 = 중복 0.3696비트 (4.2%)
+# 따라서 HW 단독 대비 실질 배율은 2.084배가 아니라 **1.997배**다.
+#
+# byte3을 헤드에 추가하면 결합 엔트로피가 +0.0000비트다. |u| < 2^23이라 상위
+# 9비트가 전부 부호 확장이어서 sign과 완전히 중복되기 때문이다. 그래서 제외한다.
+MULTITASK_REFERENCE = {
+    "heads": tuple(MULTITASK_HEADS),
+    "marginal_entropy": {"sign": 1.0000, "byte0": 2.5439,
+                         "byte1": 2.5432, "byte2": 2.6981},
+    "marginal_sum": 8.7853,
+    "joint_entropy": 8.4157,
+    "redundancy": 0.3696,
+    "hw32_entropy": 4.2147,
+    "ratio_vs_hw32": 1.997,
+    "byte3_marginal_gain": 0.0000,
+}
 
 
 def label_entropy(y, n_classes):
@@ -97,6 +117,51 @@ def perceived_information(probs, y_true, n_classes=None):
     nll_bits = float(-np.mean(np.log2(probs[np.arange(len(y)), y])))
     return {"pi": h - nll_bits, "entropy": h, "nll_bits": nll_bits,
             "pi_ratio": (h - nll_bits) / h if h > 0 else 0.0}
+
+
+def joint_entropy(head_labels, head_names=None):
+    """헤드 라벨들의 **결합** 엔트로피. 주변 엔트로피의 합이 아니다.
+
+    합을 쓰면 헤드 간 중복을 무시해 정보량을 과대평가한다(실측 4.2% 과대).
+    """
+    names = head_names or list(head_labels.keys())
+    code = np.zeros(len(head_labels[names[0]]), dtype=np.int64)
+    for n in names:
+        code = code * SCHEMES[n].n_classes + np.asarray(head_labels[n]).astype(np.int64)
+    return label_entropy(code, int(code.max()) + 1)
+
+
+def multitask_perceived_information(head_probs, head_labels, head_names=None,
+                                    joint_h=None):
+    """멀티태스크 모델의 PI.
+
+        PI = H(결합 라벨) - sum_h NLL_h(비트)
+
+    NLL을 헤드별로 더하는 것은 "헤드들이 트레이스가 주어졌을 때 조건부 독립"이라는
+    모델 가정에 해당한다. 공격 시 로그우도를 헤드별로 합산하는 것과 정확히 같은 가정이라
+    일관된다. 헤드가 실제로는 상관되어 있으면 이 PI가 그만큼 낮게 나오며, 그것이 맞다.
+
+    joint_h: 평가 표본이 작으면 결합 엔트로피 추정이 편향된다(빈이 최대 1458개).
+             None이면 표본에서 추정하고, 헤드 조합이 기본값과 같으면
+             MULTITASK_REFERENCE의 실측값(10.24M 샘플 기준)을 쓰는 편이 안전하다.
+    """
+    names = head_names or list(head_probs.keys())
+    nll = 0.0
+    per_head = {}
+    for n in names:
+        p = np.clip(np.asarray(head_probs[n], dtype=np.float64), 1e-12, 1.0)
+        p = p / p.sum(axis=1, keepdims=True)
+        y = np.asarray(head_labels[n]).astype(np.int64)
+        h_nll = float(-np.mean(np.log2(p[np.arange(len(y)), y])))
+        h_ent = label_entropy(y, SCHEMES[n].n_classes)
+        nll += h_nll
+        per_head[n] = {"entropy": h_ent, "nll_bits": h_nll, "pi": h_ent - h_nll,
+                       "top1": float((p.argmax(axis=1) == y).mean())}
+    H = joint_h if joint_h is not None else joint_entropy(head_labels, names)
+    marg = sum(v["entropy"] for v in per_head.values())
+    return {"pi": H - nll, "entropy": H, "nll_bits": nll,
+            "pi_ratio": (H - nll) / H if H > 0 else 0.0,
+            "marginal_sum": marg, "redundancy": marg - H, "per_head": per_head}
 
 
 def traces_to_recovery(pi, key_bits=KEY_BITS):
@@ -224,6 +289,67 @@ def evaluate_ensemble_variant(variant, member_probs, y_true, mode="mean",
     return m
 
 
+def evaluate_multitask_variant(variant, head_probs, head_labels, head_names=None,
+                               joint_h=None, use_reference_entropy=True,
+                               n_params=None, train_seconds=None,
+                               train_samples=None, sr100=None, oracle_sr100=None):
+    """멀티태스크 변형을 단일 헤드 변형과 같은 표에 놓을 수 있게 지표를 맞춘다.
+
+    Top-1은 **모든 헤드가 동시에 맞은 비율**(결합 정확도)로 잰다. HW 단독 모델의
+    Top-1과 같은 의미(라벨 전체를 맞혔는가)가 되어 비교가 성립한다.
+    베이스라인도 결합 라벨의 최빈 비율이다.
+    """
+    names = head_names or list(head_probs.keys())
+    if joint_h is None and use_reference_entropy and \
+            tuple(names) == MULTITASK_REFERENCE["heads"]:
+        joint_h = MULTITASK_REFERENCE["joint_entropy"]
+
+    info = multitask_perceived_information(head_probs, head_labels, names, joint_h)
+
+    correct = np.ones(len(head_labels[names[0]]), dtype=bool)
+    code = np.zeros(len(correct), dtype=np.int64)
+    for n in names:
+        p = np.asarray(head_probs[n])
+        y = np.asarray(head_labels[n]).astype(np.int64)
+        correct &= (p.argmax(axis=1) == y)
+        code = code * SCHEMES[n].n_classes + y
+    counts = np.bincount(code, minlength=int(code.max()) + 1)
+    baseline = counts.max() / counts.sum()
+    acc = float(correct.mean())
+
+    m = {
+        "name": variant.name,
+        "scheme": f"multitask({len(names)}헤드)",
+        "window": variant.window,
+        "top1": acc,
+        "baseline": float(baseline),
+        "acc_ratio": acc / baseline if baseline > 0 else 0.0,
+        "pi_bits": info["pi"],
+        "label_entropy": info["entropy"],
+        "pi_ratio": info["pi_ratio"],
+        "predicted_traces": traces_to_recovery(info["pi"]),
+        "n_params": n_params,
+        "train_seconds": train_seconds,
+        "train_samples": train_samples,
+        "measured_sr100": sr100,
+        "multitask": {
+            "heads": list(names),
+            "joint_entropy": info["entropy"],
+            "marginal_sum": info["marginal_sum"],
+            "redundancy": info["redundancy"],
+            "per_head": info["per_head"],
+        },
+    }
+    if sr100 and oracle_sr100:
+        m["oracle_efficiency"] = oracle_sr100 / sr100
+    if train_seconds and train_seconds > 0:
+        m["pi_per_minute"] = info["pi"] / (train_seconds / 60.0)
+    if variant.ensemble:
+        m["ensemble"] = dict(variant.ensemble)
+    variant.record(**m)
+    return m
+
+
 class Timer:
     def __enter__(self):
         self.t0 = time.time()
@@ -310,6 +436,66 @@ def ensemble_table(metrics_list):
     return "\n".join(L)
 
 
+def multitask_table(metrics_list):
+    """멀티태스크 변형의 헤드별 분해. 어느 헤드가 실제로 정보를 주는지 본다."""
+    mts = [m for m in metrics_list if m.get("multitask")]
+    if not mts:
+        return "_멀티태스크 변형 없음_"
+    L = []
+    A = L.append
+    for m in mts:
+        mt = m["multitask"]
+        A(f"**{m['name']}** — 헤드 {len(mt['heads'])}개\n")
+        A("| 헤드 | H(Y_h) | NLL(비트) | PI_h | PI/H | Top-1 |")
+        A("|---|---|---|---|---|---|")
+        for h in mt["heads"]:
+            d = mt["per_head"][h]
+            note = SCHEMES[h].note if h in SCHEMES else ""
+            A(f"| {h} | {d['entropy']:.3f} | {d['nll_bits']:.3f} | "
+              f"**{d['pi']:.3f}** | {d['pi']/d['entropy']*100 if d['entropy'] else 0:.1f}% | "
+              f"{d['top1']*100:.2f}% |")
+        A("")
+        A(f"- 주변 엔트로피 합 {mt['marginal_sum']:.3f} 비트, "
+          f"**결합 엔트로피 {mt['joint_entropy']:.3f} 비트**, "
+          f"중복 {mt['redundancy']:.3f} 비트 "
+          f"({mt['redundancy']/mt['marginal_sum']*100 if mt['marginal_sum'] else 0:.1f}%)")
+        A(f"- 결합 PI **{m['pi_bits']:.3f} 비트** -> 예측 트레이스 "
+          f"{m['predicted_traces']:.1f}개")
+        A("")
+    r = MULTITASK_REFERENCE
+    A("**참고: 라벨 자체의 정보량 상한** (공격셋 u 전량 10,240,000 샘플 실측)\n")
+    A("| 라벨 | 엔트로피 | HW 대비 | 완벽 모델의 필요 트레이스 |")
+    A("|---|---|---|---|")
+    A(f"| HW 단독 (33클래스) | {r['hw32_entropy']:.4f} | 1.000배 | "
+      f"{KEY_BITS/r['hw32_entropy']:.2f} |")
+    A(f"| 멀티태스크 주변 합 (상한, 쓰면 안 됨) | {r['marginal_sum']:.4f} | "
+      f"{r['marginal_sum']/r['hw32_entropy']:.3f}배 | {KEY_BITS/r['marginal_sum']:.2f} |")
+    A(f"| **멀티태스크 결합 (실제)** | **{r['joint_entropy']:.4f}** | "
+      f"**{r['ratio_vs_hw32']:.3f}배** | **{KEY_BITS/r['joint_entropy']:.2f}** |")
+    A("")
+    A("주변 엔트로피의 단순 합은 헤드가 완전히 독립일 때만 성립하는 상한이다.")
+    A(f"실제로는 {r['redundancy']:.4f}비트({r['redundancy']/r['marginal_sum']*100:.1f}%)가 중복이라 결합 엔트로피를 써야 한다.")
+    A("")
+    A(f"`byte3`은 헤드에 추가해도 결합 엔트로피가 +{r['byte3_marginal_gain']:.4f}비트다.")
+    A("|u| < 2^23이라 상위 9비트가 전부 부호 확장이어서 `sign`과 완전히 중복된다.")
+    A("(실측에서 bit24/bit28/bit31의 |rho|가 0.7238로 완전히 동일했다.)")
+    A("")
+    A("**주의: 상한과 실현치는 다르다.** 1.997배는 라벨이 담을 수 있는 정보량의 상한일 뿐,")
+    A("헤드마다 학습 난이도가 크게 다르다. 선형 프로브 실측 PI_h는 다음과 같았다.\n")
+    A("| 헤드 | 누설 \\|rho\\| | H(Y_h) | 실측 PI_h | 비고 |")
+    A("|---|---|---|---|---|")
+    A("| sign | 0.72 | 1.000 | **+0.643** | 쉽게 학습됨 (Top-1 91%) |")
+    A("| byte2 | 0.57 | 2.692 | +0.096 | 겨우 양수 |")
+    A("| byte1 | 0.29 | 2.550 | -0.148 | 학습 실패 |")
+    A("| byte0 | 0.24 | 2.543 | -0.149 | 학습 실패 |")
+    A("")
+    A("결합 엔트로피 8.416비트 중 **5.09비트가 byte0/byte1에 있는데 둘 다 누설이 약하다.**")
+    A("즉 멀티태스크의 이득은 '약한 바이트를 학습할 수 있는가'에 전적으로 달려 있다.")
+    A("강한 CNN이 이를 해내는지 반드시 PI_h로 헤드별 확인할 것. 특정 헤드의 PI_h가")
+    A("음수면 그 헤드는 정보를 주는 게 아니라 뺏고 있으므로 `loss_weights`에서 낮추거나 뺀다.")
+    return "\n".join(L)
+
+
 def efficiency_table(metrics_list):
     """학습 비용 대비 효율. 같은 성능이면 싼 쪽이 낫다."""
     L = []
@@ -339,6 +525,8 @@ def render_benchmark(out_path, metrics_list, notes=""):
     A("키 공간이 23.0비트이므로 `필요 트레이스 = 23.0 / PI`로 예측한다.\n")
     A("## 성능\n")
     A(comparison_table(metrics_list))
+    A("\n## 멀티태스크 헤드 분해\n")
+    A(multitask_table(metrics_list))
     A("\n## 앙상블 다양성\n")
     A(ensemble_table(metrics_list))
     A("\n## 학습 비용 대비 효율\n")
