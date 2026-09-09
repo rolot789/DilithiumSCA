@@ -20,11 +20,26 @@ description: Dilithium v3 부채널 공격 모델을 처음부터 끝까지 실�
 ## 사전 준비
 
 ```python
-import sys, os
+import sys, os, time
+import numpy as np
 sys.path.insert(0, "project v3")
 DATASET = "../Dataset"     # 원본 DSCAD 파일 위치
 WORK    = "v3_work"        # 중간 산출물 디렉터리
 os.makedirs(WORK, exist_ok=True)
+
+POLY, COEFF = 0, 50        # 공격 대상 계수 (전 단계에서 공통으로 쓴다)
+WINDOW, OFFSET = 96, 24    # 윈도우 설정 (Step 5 근거 참조)
+all_metrics = []           # 벤치마크 누적 (Step 6-4에서 채운다)
+```
+
+**변수 흐름**: 뒤 단계는 앞 단계에서 만든 변수를 그대로 쓴다. 순서대로 실행할 것.
+
+```
+Step 3  -> prof_path, atk_path, cfg
+Step 4  -> Xp, Xa
+Step 5  -> hw, cm, train_idx, val_idx, train, val, model
+Step 6-1 -> u_atk, atk_sampler, probs, y_atk
+Step 6-2 -> cal, atk          <- 5c/5d의 평가 부분은 이 분할이 필요하다
 ```
 
 ---
@@ -168,7 +183,6 @@ hw     = s2.precompute_hw_labels(u_prof)
 cm     = s2.build_time_map(centers)
 train_idx, val_idx = s2.set_split_indices(val_set=4)   # leave-one-set-out
 
-WINDOW, OFFSET = 96, 24    # 실측 근거는 아래 참조
 train = s2.CoefficientWindowSampler(Xp, hw, cm, train_idx, window=WINDOW,
                                     window_offset=OFFSET, batch_size=512,
                                     traces_per_batch=32, shift_aug=1, seed=0)
@@ -229,11 +243,30 @@ train_mt = s2.CoefficientWindowSampler(Xp, hw, cm, train_idx, window=WINDOW,
                                        window_offset=OFFSET, batch_size=512,
                                        traces_per_batch=32, shift_aug=1, seed=0,
                                        extra_labels=extra)
+val_mt   = s2.CoefficientWindowSampler(Xp, hw, cm, val_idx, window=WINDOW,
+                                       window_offset=OFFSET, batch_size=512,
+                                       traces_per_batch=32, shift_aug=0, seed=1,
+                                       extra_labels=extra)
+
 mt = vm.compile_multitask(vm.build_multitask_model(window=WINDOW))
+mt_history = mt.fit(
+    s2.to_tf_dataset(train_mt),
+    validation_data=s2.to_tf_dataset(val_mt),
+    steps_per_epoch=min(train_mt.steps_per_epoch(), 2000),
+    validation_steps=200, epochs=50,
+    callbacks=vm.make_callbacks(f"{WORK}/v3_multitask.keras"),
+)
 ```
 
+**라벨 형식 주의**: 멀티태스크 샘플러는 라벨을 `{헤드: 정수}` dict로 내놓고
+`compile_multitask()`는 `SparseCategoricalCrossentropy`를 쓴다. `to_tf_dataset()`이
+이를 자동으로 구분하므로 one-hot을 씌우지 않는다(헤드마다 클래스 수가 2 또는 9로
+달라 공통 one-hot 자체가 불가능하다). 샘플러 출력 키는
+`extra_labels` + `hw`이므로 모델은 `build_multitask_model(include_hw=True)`
+(기본값)여야 이름이 맞는다.
+
 **중요: 헤드를 미리 쳐내지 말고 4개 전부로 학습한다.** 어떤 헤드를 쓸지는
-학습이 끝난 뒤 Step 6-e에서 이 모델의 실측치로 결정한다. 선형 프로브 기준으로는
+학습이 끝난 뒤 Step 6-5에서 이 모델의 실측치로 결정한다. 선형 프로브 기준으로는
 `sign` 단독이 가장 좋았지만, 그것은 프로브가 약한 바이트를 학습하지 못했기
 때문일 수 있다. **강한 CNN에서는 결론이 뒤집힐 수 있다.**
 
@@ -242,6 +275,9 @@ byte3은 sign과 완전 중복이라(결합 엔트로피 기여 +0.0000비트) �
 ---
 
 ### 5c. 앙상블 (선택)
+
+**여기서는 멤버 학습만 한다.** 결합과 평가는 캘리브레이션 분할이 필요하므로
+Step 6-2 이후(6-4)에서 한다.
 
 ```python
 import v3_ensemble as en
@@ -260,15 +296,10 @@ for i, sp in enumerate(specs):
     members.append((m, sp))
 
 ens = en.Ensemble(members)
-factory = lambda sp: s2.CoefficientWindowSampler(Xa, hw_atk, cm, np.arange(vc.N_ATTACK),
-                                                 batch_size=512, traces_per_batch=32,
-                                                 shift_aug=0, seed=2, **sp)
-_, member_probs = ens.predict(factory, np.arange(vc.N_ATTACK), POLY, COEFF)
-ens.calibrate([p[cal] for p in member_probs], y_atk[cal])    # 공격셋 미사용
-probs_ens = en.combine_probs(member_probs, ens.mode, ens.weights)
-print(en.ensemble_gain([p[atk] for p in member_probs], y_atk[atk], ens.mode, ens.weights))
-en.diversity_report([p[atk] for p in member_probs], y_atk[atk])
 ```
+
+멤버마다 윈도우가 달라 `**sp`로 `window`/`window_offset`을 함께 넘긴다.
+`build_model(window=sp["window"])`의 입력 폭도 반드시 같아야 한다.
 
 **다양성 구성 선택 근거** (선형 프로브 실측):
 
@@ -334,19 +365,30 @@ import v3_report as rp, v3_evaluate as ev
 ### 6-1. 분류 성능
 
 ```python
-POLY, COEFF = 0, 50
 u_atk = vc.load_array(DATASET, "attack_10000_u=cs.npy")
-atk_sampler = s2.CoefficientWindowSampler(Xa, s2.precompute_hw_labels(u_atk),
-                                          cm, np.arange(vc.N_ATTACK), window=32,
+hw_atk = s2.precompute_hw_labels(u_atk)
+atk_sampler = s2.CoefficientWindowSampler(Xa, hw_atk, cm, np.arange(vc.N_ATTACK),
+                                          window=WINDOW, window_offset=OFFSET,
                                           batch_size=512, traces_per_batch=32,
                                           shift_aug=0, seed=2)
 probs = vm.predict_coefficient_probs(model, atk_sampler,
                                      np.arange(vc.N_ATTACK), POLY, COEFF)
 y_atk = vc.hw32(u_atk[:, POLY, COEFF]).astype(np.int64)
 cls_atk = rp.classification_report(probs, y_atk, label="공격셋")
+
+# 검증셋(프로파일링 set4)도 같은 방식으로
+val_sampler = s2.CoefficientWindowSampler(Xp, hw, cm, val_idx,
+                                          window=WINDOW, window_offset=OFFSET,
+                                          batch_size=512, traces_per_batch=32,
+                                          shift_aug=0, seed=3)
+probs_val = vm.predict_coefficient_probs(model, val_sampler, val_idx, POLY, COEFF)
+y_val = vc.hw32(np.asarray(u_prof)[val_idx, POLY, COEFF]).astype(np.int64)
+cls_val = rp.classification_report(probs_val, y_val, label="검증셋")
 ```
 
-검증셋에 대해서도 같은 방식으로 `cls_val`을 만든다.
+**`window`/`window_offset`은 학습 때와 반드시 같아야 한다.** 다르면 모델 입력
+shape이 어긋나고, 같더라도 오프셋이 다르면 엉뚱한 구간을 보게 된다.
+
 **두 값의 차이가 이식성 격차다** (v2는 4.5%p였다).
 
 ### 6-1b. 계수별 편차 (계수 불변 모델의 핵심 검증)
@@ -391,55 +433,95 @@ attack = rp.attack_report(probs[cal], y_atk[cal], probs[atk], c_atk[atk],
 - 온도를 공격셋에서 고르지 말 것
 - 동점 처리를 빼지 말 것 (GE가 0으로 붕괴해 성공한 것처럼 보인다)
 
-### 6-d. 학습 방식 간 효율 비교 (PI)
+### 6-4. 학습 방식 간 효율 비교 (PI)
 
 여러 학습 방식을 시도했다면 **PI(Perceived Information)** 로 비교한다.
 정확도는 라벨 종류가 다르면 비교 자체가 불가능하지만 PI는 같은 비트 단위다.
 
+**모든 평가는 `atk` 분할에서 한다.** `cal`은 온도/가중치 학습 전용이다.
+
 ```python
 import v3_benchmark as bm
 
-# 단일 모델
-v = bm.Variant("멀티태스크 w96", "sign+byte0~2, window=96", scheme="multitask", window=96)
-m = bm.evaluate_variant(v, probs, y_atk, n_params=model.count_params(),
-                        train_seconds=elapsed, train_samples=train.samples_per_epoch(),
-                        sr100=attack["traces_to_sr100"], oracle_sr100=6)
-all_metrics.append(m)
+# 단일 모델 (기준선)
+v = bm.Variant("단일 HW", f"window={WINDOW}", scheme="hw32", window=WINDOW)
+all_metrics.append(bm.evaluate_variant(
+    v, probs[atk], y_atk[atk], n_params=model.count_params(),
+    train_samples=train.samples_per_epoch(),
+    sr100=attack["traces_to_sr100"], oracle_sr100=6))
+```
 
-# 앙상블은 멤버 확률 리스트를 넘긴다. 다양성과 이득이 자동으로 채워진다.
+앙상블은 Step 5c에서 학습해둔 멤버를 여기서 결합한다(캘리브레이션 분할이
+이제 존재하므로).
+
+```python
+factory = lambda sp: s2.CoefficientWindowSampler(
+    Xa, hw_atk, cm, np.arange(vc.N_ATTACK),
+    batch_size=512, traces_per_batch=32, shift_aug=0, seed=2, **sp)
+_, member_probs = ens.predict(factory, np.arange(vc.N_ATTACK), POLY, COEFF)
+
+ens.calibrate([p[cal] for p in member_probs], y_atk[cal])   # 공격셋 미사용
+en.diversity_report([p[atk] for p in member_probs], y_atk[atk])
+
 ve = bm.Variant("앙상블 넓은창+disjoint", "", window=128,
-                ensemble={"source": "mixed"})     # bagging|nested|disjoint|mixed|snapshot
-me = bm.evaluate_ensemble_variant(ve, [p[atk] for p in member_probs], y_atk[atk],
-                                  ens.mode, ens.weights,
-                                  n_params=sum(m.count_params() for m, _ in members),
-                                  train_seconds=elapsed_all)
-all_metrics.append(me)
-
-bm.render_benchmark(f"{WORK}/benchmark.md", all_metrics)
+                ensemble={"source": "mixed"})   # bagging|nested|disjoint|mixed|snapshot
+all_metrics.append(bm.evaluate_ensemble_variant(
+    ve, [p[atk] for p in member_probs], y_atk[atk], ens.mode, ens.weights,
+    n_params=sum(mm.count_params() for mm, _ in members)))
 ```
 
 멀티태스크는 헤드가 여러 개라 전용 함수를 쓴다. Top-1은 **모든 헤드가 동시에
 맞은 비율**로 재어 단일 헤드 모델과 비교가 성립하게 한다.
 
 ```python
-vm_ = bm.Variant("멀티태스크 w128", "sign+byte0~2", window=128)
-mm = bm.evaluate_multitask_variant(vm_, head_probs, head_labels,
-                                   n_params=model.count_params(),
-                                   train_seconds=elapsed)
-all_metrics.append(mm)
+head_probs  = vm.predict_multitask_head_probs(mt, atk_sampler,
+                                              np.arange(vc.N_ATTACK), POLY, COEFF)
+head_labels = vm.head_labels_for(u_atk, POLY, COEFF)
+
+mv = bm.Variant("멀티태스크 4헤드", "sign+byte0~2", window=WINDOW)
+all_metrics.append(bm.evaluate_multitask_variant(
+    mv, {h: p[atk] for h, p in head_probs.items()},
+    {h: y[atk] for h, y in head_labels.items()},
+    n_params=mt.count_params()))
 ```
 
+`predict_multitask_head_probs`는 `hw` 헤드까지 포함해 반환한다. 4헤드 평가에는
+`head_labels_for()`가 주는 4개 키만 쓰므로 dict 키를 맞춰 넘긴다.
+
 멀티태스크 리포트에는 **헤드 분해 표**(단독 PI_h, 한계 기여, "빼면?" 판정)가
-들어간다. **어느 헤드를 쓸지는 여기서 정하지 말고 Step 6-e에서 결정한다.**
+들어간다. **어느 헤드를 쓸지는 여기서 정하지 말고 Step 6-5에서 결정한다.**
 
 **앙상블을 멀티태스크로 구성할 때**는 헤드별로 결합한다. 멤버마다 잘하는 헤드가
 다르기 때문이다(실측: sign은 넓은 창 멤버에 가중치 0.966이 몰렸지만,
 byte0은 [0.348, 0.085, 0.229, 0.274, 0.064]로 disjoint 멤버들에 퍼졌다).
 
+멤버가 **멀티태스크 모델**이어야 한다. 5c의 멤버는 단일 헤드이므로 따로 학습한다.
+
 ```python
-sel = en.select_combine_mode_multitask(member_head_probs_cal, head_labels_cal)
-mm = bm.evaluate_multitask_ensemble_variant(v, member_head_probs_atk, head_labels_atk,
-                                            sel["mode"], sel["per_head_weights"])
+mt_members = []
+for i, sp in enumerate(specs):
+    tr = s2.CoefficientWindowSampler(Xp, hw, cm, train_idx, batch_size=512,
+                                     traces_per_batch=32, shift_aug=1, seed=i,
+                                     extra_labels=extra, **sp)
+    mm_ = vm.compile_multitask(vm.build_multitask_model(window=sp["window"]))
+    mm_.fit(s2.to_tf_dataset(tr), steps_per_epoch=1000, epochs=30)
+    mt_members.append((mm_, sp))
+
+member_head_probs = []
+for mm_, sp in mt_members:
+    hp = vm.predict_multitask_head_probs(mm_, factory(sp),
+                                         np.arange(vc.N_ATTACK), POLY, COEFF)
+    member_head_probs.append({h: hp[h] for h in head_labels})   # hw 헤드 제외
+
+sel = en.select_combine_mode_multitask(
+    [{h: p[cal] for h, p in mp.items()} for mp in member_head_probs],
+    {h: y[cal] for h, y in head_labels.items()})
+
+mve = bm.Variant("앙상블 멀티태스크", "", window=128, ensemble={"source": "mixed"})
+all_metrics.append(bm.evaluate_multitask_ensemble_variant(
+    mve, [{h: p[atk] for h, p in mp.items()} for mp in member_head_probs],
+    {h: y[atk] for h, y in head_labels.items()},
+    sel["mode"], sel["per_head_weights"]))
 ```
 
 리포트에는 **앙상블 다양성 표**도 별도로 들어간다(다양성 원천, 멤버 수, 결합 방식,
@@ -470,7 +552,7 @@ mm = bm.evaluate_multitask_ensemble_variant(v, member_head_probs_atk, head_label
 
 ---
 
-### 6-e. 강한 CNN 기준 헤드 재선택 (멀티태스크를 쓴 경우 필수)
+### 6-5. 강한 CNN 기준 헤드 재선택 (멀티태스크를 쓴 경우 필수)
 
 **기존 헤드 결론을 그대로 물려받지 말 것.** 지금까지 기록된
 "`sign` 단독이 최선"은 **선형 프로브로 잰 값**이며, 그 프로브가 byte0/byte1을
@@ -484,9 +566,11 @@ byte0/byte1에 있으므로**, CNN이 이 둘을 학습해내면 결론이 뒤�
 import v3_benchmark as bm
 
 # 1) 헤드 4개 전부로 학습된 모델에서 헤드별 확률을 뽑는다 (미리 쳐내지 않았어야 한다)
-head_probs = {h: mt.predict(X_windows, verbose=0)[i]
-              for i, h in enumerate(mt.output_names)}
-head_labels = {h: bm.SCHEMES[h](u_atk_sel).astype("int64") for h in head_probs}
+#    6-4에서 이미 만들었다면 그대로 재사용한다.
+head_probs  = vm.predict_multitask_head_probs(mt, atk_sampler,
+                                              np.arange(vc.N_ATTACK), POLY, COEFF)
+head_labels = vm.head_labels_for(u_atk, POLY, COEFF)
+head_probs  = {h: head_probs[h] for h in head_labels}   # hw 헤드는 제외
 
 # 2) 헤드별 온도 보정 (반드시 캘리브레이션셋에서)
 import v3_evaluate as ev
@@ -629,7 +713,7 @@ bm.sync_docs()      # instruction_v3.md 10.3절 + README.md 5.4절
 ```
 
 레포의 사양서와 README에 있는 **헤드 실측값 AUTO 블록**을 현재
-`head_baseline.json`과 맞춘다. Step 6-e에서 `baseline_from_ablation()`을
+`head_baseline.json`과 맞춘다. Step 6-5에서 `baseline_from_ablation()`을
 호출했다면 이미 갱신되어 있지만, **항상 한 번 더 실행한다.** 이유는 두 가지다.
 
 - 멱등이라 부작용이 없다. 이미 맞으면 "변경 없음"만 출력한다.
@@ -675,6 +759,6 @@ print("헤드 기준값 출처:", b["source"], "| 선택된 헤드:", b["chosen_
 | 검증-공격 격차 큼 | `vertical_source="own"` 확인, Step 4 이식성 재측정 |
 | 메모리 부족 | `traces_per_batch` 축소, memmap이 float16인지 확인 |
 | 학습이 느림 | Metal 인식 여부, `traces_per_batch`(지역성), XLA off 확인 |
-| 멀티태스크가 HW 단독보다 나쁨 | Step 6-e로 헤드 재선택. 한계 기여가 음수인 헤드를 공격에서 뺀다 |
+| 멀티태스크가 HW 단독보다 나쁨 | Step 6-5로 헤드 재선택. 한계 기여가 음수인 헤드를 공격에서 뺀다 |
 | `select_heads`가 `sign` 단독으로 수렴 | CNN도 약한 바이트 학습 실패. 약한 헤드 `loss_weights` 상향, 윈도우 확대, 앙상블 결합을 먼저 시도 |
 | 헤드 온도가 0.05나 30에 닿음 | 그리드 경계 문제. 보정이 덜 된 상태라 PI가 왜곡된다 |

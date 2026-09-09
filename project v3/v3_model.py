@@ -75,12 +75,16 @@ def build_multitask_model(window, heads=None, width=32, n_blocks=3,
                           metal_safe=True, include_hw=True):
     """공유 트렁크 + 헤드 여러 개.
 
-    HW 하나만 예측하면 트레이스당 4.215비트가 상한이다. 바이트별 HW를 나눠
-    예측하면 헤드 합이 8.78비트로 약 2.1배가 되고, 필요한 트레이스 수가 절반이 된다.
-    (v3_benchmark의 실측 근거 참조)
+    HW 하나만 예측하면 트레이스당 4.2147비트가 상한이다. sign/byte0~2로 나누면
+    **결합 엔트로피 8.4157비트**로 1.997배가 되고, 완벽 모델 기준 필요 트레이스가
+    5.46개에서 2.73개로 준다.
 
-    헤드끼리 정보가 겹치므로 합이 그대로 실현되지는 않는다. 반드시 PI와 실측 GE로
-    검증할 것.
+    주변 엔트로피의 단순 합(8.7853)을 쓰면 안 된다. 헤드가 독립일 때만 성립하는
+    상한이고 실제로는 0.3696비트(4.2%)가 중복이다.
+
+    **헤드를 미리 쳐내지 말고 전부 학습할 것.** 어떤 헤드를 쓸지는 학습 후
+    `v3_benchmark.head_ablation()` / `select_heads()`로 한계 기여를 재서 정한다.
+    단독 PI가 양수여도 한계 기여가 음수인 경우가 실재한다.
     """
     from tensorflow.keras import layers, Model
     from v3_benchmark import MULTITASK_HEADS, SCHEMES
@@ -160,6 +164,30 @@ def predict_coefficient_probs(model, sampler, trace_indices, poly, coeff,
         sampler.full_coefficient_batch(ti, poly, [coeff]) for ti in trace_indices
     ])
     return model.predict(windows, batch_size=batch_size, verbose=0)
+
+
+def predict_multitask_head_probs(model, sampler, trace_indices, poly, coeff,
+                                 batch_size=256):
+    """멀티태스크 모델의 헤드별 확률 dict를 만든다.
+
+    `predict_coefficient_probs`의 멀티태스크 판이다. Step 6-5(헤드 재선택)와
+    `v3_benchmark.evaluate_multitask_variant`에 그대로 넘길 수 있다.
+    """
+    windows = np.concatenate([
+        sampler.full_coefficient_batch(ti, poly, [coeff]) for ti in trace_indices
+    ])
+    out = model.predict(windows, batch_size=batch_size, verbose=0)
+    if isinstance(out, dict):
+        return {h: np.asarray(p) for h, p in out.items()}
+    return {h: np.asarray(p) for h, p in zip(model.output_names, out)}
+
+
+def head_labels_for(u_labels, poly, coeff, head_names=None):
+    """헤드별 정답 라벨 dict. predict_multitask_head_probs와 짝을 이룬다."""
+    from v3_benchmark import MULTITASK_HEADS, SCHEMES
+    names = head_names or MULTITASK_HEADS
+    u = np.asarray(u_labels)[:, poly, coeff]
+    return {h: SCHEMES[h](u).astype(np.int64) for h in names}
 
 
 def evaluate_accuracy(model, sampler, n_batches=200):

@@ -55,8 +55,9 @@ def precompute_hw_labels(u_labels):
 def precompute_multitask_labels(u_labels, head_names=None):
     """멀티태스크 헤드별 라벨을 미리 만든다.
 
-    HW 하나(H=4.215비트)보다 바이트별 HW를 나눠 예측하는 쪽이 트레이스당 정보량이
-    크다(헤드 합 8.78비트, 약 2.1배). 정보량이 2배면 필요한 트레이스 수가 절반이다.
+    HW 하나(H=4.2147비트)보다 나눠 예측하는 쪽이 트레이스당 정보량이 크다
+    (**결합 엔트로피 8.4157비트, 1.997배**). 정보량이 2배면 필요 트레이스가 절반이다.
+    주변 엔트로피의 합(8.7853)은 헤드가 독립일 때만 성립하는 상한이라 쓰지 않는다.
 
     주의: byte3은 사실상 8 x 부호비트다. |u| < 2^23이라 상위 9비트가 전부 부호
     확장이기 때문이며, 실측에서 bit24/bit28/bit31의 |rho|가 0.7238로 완전히 같다.
@@ -214,14 +215,32 @@ class CoefficientWindowSampler:
 
 
 def to_tf_dataset(sampler, n_classes=33):
-    """tf.data 래핑. 배치 단위 제너레이터라 Python 오버헤드가 배치당으로 줄어든다."""
+    """tf.data 래핑. 배치 단위 제너레이터라 Python 오버헤드가 배치당으로 줄어든다.
+
+    단일 헤드와 멀티태스크를 모두 처리한다. 라벨 형식이 손실 함수와 짝이 맞아야 한다.
+
+      단일 헤드   : y를 one-hot으로. compile_model()이 CategoricalCrossentropy를 쓴다.
+      멀티태스크  : y를 정수 dict 그대로. compile_multitask()가
+                   SparseCategoricalCrossentropy를 쓰므로 one-hot을 씌우면 안 되고,
+                   헤드마다 클래스 수가 달라(2 또는 9) 공통 one_hot도 불가능하다.
+    """
     import tensorflow as tf
 
-    sig = (
-        tf.TensorSpec(shape=(sampler.batch_size, sampler.window, 1), dtype=tf.float32),
-        tf.TensorSpec(shape=(sampler.batch_size,), dtype=tf.int32),
-    )
-    ds = tf.data.Dataset.from_generator(sampler.batches, output_signature=sig)
+    x_spec = tf.TensorSpec(shape=(sampler.batch_size, sampler.window, 1),
+                           dtype=tf.float32)
+    if getattr(sampler, "extra_labels", None):
+        # 샘플러는 extra_labels + "hw"를 내놓는다. 모델 출력 이름과 정확히 맞아야
+        # 하므로 build_multitask_model(include_hw=True)여야 한다(기본값).
+        heads = list(sampler.extra_labels.keys()) + ["hw"]
+        y_spec = {h: tf.TensorSpec(shape=(sampler.batch_size,), dtype=tf.int32)
+                  for h in heads}
+        ds = tf.data.Dataset.from_generator(sampler.batches,
+                                            output_signature=(x_spec, y_spec))
+        return ds.prefetch(tf.data.AUTOTUNE)
+
+    y_spec = tf.TensorSpec(shape=(sampler.batch_size,), dtype=tf.int32)
+    ds = tf.data.Dataset.from_generator(sampler.batches,
+                                        output_signature=(x_spec, y_spec))
     ds = ds.map(lambda x, y: (x, tf.one_hot(y, n_classes)),
                 num_parallel_calls=tf.data.AUTOTUNE)
     return ds.prefetch(tf.data.AUTOTUNE)

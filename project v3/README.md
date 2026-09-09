@@ -588,7 +588,7 @@ PI는 **음수가 될 수 있다.** 모델이 확신을 갖고 틀리면 정보�
 
 byte2는 단독 PI가 양수(+0.241)인데 한계 기여는 음수(-0.140)다. sign과 0.366비트 겹쳐 결합 엔트로피를 H(Y_h)만큼 올리지 못하기 때문. byte0/byte1은 누설이 가장 약해(|rho| 0.24~0.29) 이 프로브로는 학습에 실패했다.
 
-**이 값은 선형 프로브 기준이다.** 약한 바이트를 학습해내는 강한 CNN이라면 결론이 달라진다. 스킬 Step 6-e에서 `baseline_from_ablation('cnn', ...)`을 호출하면 이 블록이 CNN 실측치로 자동 교체된다.
+**이 값은 선형 프로브 기준이다.** 약한 바이트를 학습해내는 강한 CNN이라면 결론이 달라진다. 스킬 Step 6-5에서 `baseline_from_ablation('cnn', ...)`을 호출하면 이 블록이 CNN 실측치로 자동 교체된다.
 
 <!-- AUTO:head-baseline:end -->
 
@@ -717,15 +717,18 @@ u = vc.load_array("../Dataset", "profiling_40000_u=cs.npy")
 hw = s2.precompute_hw_labels(u)
 train_idx, val_idx = s2.set_split_indices(val_set=4)
 
+WINDOW, OFFSET = 96, 24        # 실측 권장값 (5.3절 참조)
 train = s2.CoefficientWindowSampler(X, hw, centers, train_idx,
-                                    window=32, batch_size=512,
+                                    window=WINDOW, window_offset=OFFSET,
+                                    batch_size=512,
                                     traces_per_batch=32, shift_aug=1, seed=0)
 val   = s2.CoefficientWindowSampler(X, hw, centers, val_idx,
-                                    window=32, batch_size=512,
+                                    window=WINDOW, window_offset=OFFSET,
+                                    batch_size=512,
                                     traces_per_batch=32, shift_aug=0, seed=1)
 
 # 5) 학습
-model = vm.compile_model(vm.build_model(window=32))
+model = vm.compile_model(vm.build_model(window=WINDOW))
 model.fit(s2.to_tf_dataset(train),
           validation_data=s2.to_tf_dataset(val),
           steps_per_epoch=train.steps_per_epoch(),

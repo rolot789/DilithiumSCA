@@ -21,10 +21,13 @@ H(Y)는 라벨의 엔트로피(라벨이 원래 담고 있는 정보량), 뒤 �
 
 이 예측이 실측 GE/SR 곡선과 맞는지도 함께 확인한다.
 
-실측 근거 (완벽 오라클 기준, 트레이스당 정보량):
-    sign(1비트)          1.00 비트  ->  23개 필요
-    HW 전체(33클래스)     4.04 비트  ->   6개 필요
-    바이트별 HW 4개      10.83 비트  ->   3개 필요
+라벨 자체의 정보량 상한 (공격셋 u 전량 10,240,000 샘플로 실측한 엔트로피):
+    sign(1비트)               1.0000 비트  ->  23.0개 필요
+    HW 전체(33클래스)          4.2147 비트  ->   5.46개 필요
+    멀티태스크 결합(4헤드)      8.4157 비트  ->   2.73개 필요
+
+주변 엔트로피의 단순 합(8.7853)은 헤드가 독립일 때만 성립하는 상한이므로 쓰지
+않는다. 실제 중복이 0.3696비트(4.2%)다. 자세한 값은 MULTITASK_REFERENCE 참조.
 """
 
 import json
@@ -63,10 +66,10 @@ def _byte_hw(u, b):
 SCHEMES = {
     "hw32": LabelScheme(
         "hw32", lambda u: hw32(u).astype(np.int64), 33,
-        "v2/v3 기본. 32비트 HW. 실측 4.04비트/트레이스"),
+        "v2/v3 기본. 32비트 HW. H(Y)=4.2147비트"),
     "sign": LabelScheme(
         "sign", lambda u: (np.asarray(u) < 0).astype(np.int64), 2,
-        "부호만. |u|<2^23이라 상위 9비트가 전부 부호비트다. 실측 1.00비트"),
+        "부호만. |u|<2^23이라 상위 9비트가 전부 부호 확장이다. H(Y)=1.0000비트"),
     "byte0": LabelScheme("byte0", lambda u: _byte_hw(u, 0).astype(np.int64), 9,
                          "bit 0~7의 HW. 누설 약함 (|rho| 0.24)"),
     "byte1": LabelScheme("byte1", lambda u: _byte_hw(u, 1).astype(np.int64), 9,
@@ -223,7 +226,7 @@ def render_head_baseline_md(baseline=None):
         L += ["", b["notes"]]
     if src == "linear_probe":
         L += ["", "**이 값은 선형 프로브 기준이다.** 약한 바이트를 학습해내는 강한 "
-                  "CNN이라면 결론이 달라진다. 스킬 Step 6-e에서 "
+                  "CNN이라면 결론이 달라진다. 스킬 Step 6-5에서 "
                   "`baseline_from_ablation('cnn', ...)`을 호출하면 이 블록이 "
                   "CNN 실측치로 자동 교체된다."]
     return "\n".join(L)
@@ -264,7 +267,7 @@ def baseline_from_ablation(source, head_probs, head_labels, head_names=None,
                            model_info=None, notes="", path=None):
     """한 번의 호출로 한계 기여를 계산하고 기준값까지 기록한다.
 
-    Step 6-e 끝에서 이것만 호출하면 된다. **캘리브레이션셋 확률을 넘길 것.**
+    Step 6-5 끝에서 이것만 호출하면 된다. **캘리브레이션셋 확률을 넘길 것.**
     """
     names = list(head_names or head_probs.keys())
     info = multitask_perceived_information(head_probs, head_labels, names)
@@ -427,7 +430,7 @@ class Variant:
     """
 
     def __init__(self, name, description, build_fn=None, scheme="hw32",
-                 window=32, extra=None, ensemble=None):
+                 window=96, extra=None, ensemble=None):
         self.name = name
         self.description = description
         self.build_fn = build_fn
@@ -783,7 +786,7 @@ def multitask_table(metrics_list):
         if src == "linear_probe":
             A("")
             A("**이 값은 선형 프로브 기준이다.** 약한 바이트를 학습해내는 강한 CNN이라면")
-            A("결론이 달라진다. Step 6-e에서 `baseline_from_ablation('cnn', ...)`을 호출해")
+            A("결론이 달라진다. Step 6-5에서 `baseline_from_ablation('cnn', ...)`을 호출해")
             A("CNN 실측치로 교체할 것.")
         A("")
     else:
@@ -830,14 +833,21 @@ def render_benchmark(out_path, metrics_list, notes=""):
     A(ensemble_table(metrics_list))
     A("\n## 학습 비용 대비 효율\n")
     A(efficiency_table(metrics_list))
+    r = MULTITASK_REFERENCE
     A("\n## 참고: 완벽 오라클 기준선\n")
+    A("라벨 자체의 엔트로피 상한이다 (공격셋 u 전량 10,240,000 샘플 실측).\n")
     A("| 라벨 | 트레이스당 정보량 | 필요 트레이스 |")
     A("|---|---|---|")
-    A("| sign (1비트) | 1.00 비트 | 23 |")
-    A("| HW 전체 (33클래스) | 4.04 비트 | 6 |")
-    A("| 바이트별 HW 4개 | 10.83 비트 | 3 |")
+    A(f"| sign (1비트) | {r['marginal_entropy']['sign']:.4f} 비트 | "
+      f"{KEY_BITS / r['marginal_entropy']['sign']:.2f} |")
+    A(f"| HW 전체 (33클래스) | {r['hw32_entropy']:.4f} 비트 | "
+      f"{KEY_BITS / r['hw32_entropy']:.2f} |")
+    A(f"| 멀티태스크 결합 (4헤드) | {r['joint_entropy']:.4f} 비트 | "
+      f"{KEY_BITS / r['joint_entropy']:.2f} |")
     A("\n어떤 모델도 해당 라벨의 오라클보다 잘할 수 없다. PI가 오라클 정보량에")
-    A("얼마나 근접했는지가 그 학습 방식의 완성도다.\n")
+    A("얼마나 근접했는지가 그 학습 방식의 완성도다.")
+    A("\n참고로 GE/SR 시뮬레이션에서 HW 오라클은 6개 트레이스에서 SR 100%에")
+    A("도달했다. 위 5.46개는 유한 후보 효과를 뺀 이론값이다.\n")
     if notes:
         A("## 메모\n")
         A(notes)
