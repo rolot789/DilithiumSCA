@@ -1,6 +1,6 @@
 ---
 name: dilithium-v3-run
-description: Dilithium v3 부채널 공격 모델을 처음부터 끝까지 실행하고 리포트를 생성한다. 환경 점검, 데이터 검증, 전처리, 시간 매핑 보정, 학습, 3단계 평가, 마크다운 리포트까지 단계별로 진행하며 각 단계마다 통과 조건을 확인한다. 사용자가 "v3 학습 돌려줘", "모델 학습하고 리포트 뽑아줘", "이식성 측정해줘", "GE 재줘" 같은 요청을 할 때 사용한다. Apple Silicon(M시리즈) 환경을 기본 가정한다.
+description: Dilithium v3 부채널 공격 모델을 처음부터 끝까지 실행하고 리포트를 생성한다. 환경 점검, 데이터 검증, 전처리, 시간 매핑 보정, 학습(단일/멀티태스크/앙상블), 3단계 평가, PI 기반 학습 방식 비교, 강한 CNN 기준 헤드 재선택, 마크다운 리포트까지 단계별로 진행하며 각 단계마다 통과 조건을 확인한다. 사용자가 "v3 학습 돌려줘", "모델 학습하고 리포트 뽑아줘", "이식성 측정해줘", "GE 재줘", "헤드 선택 다시 확인해줘", "앙상블 벤치마크 돌려줘" 같은 요청을 할 때 사용한다. Apple Silicon(M시리즈) 환경을 기본 가정한다.
 ---
 
 # Dilithium v3 실행 및 리포트 생성
@@ -204,24 +204,6 @@ window= 64 offset=16  0.8587 (+7.7%)    window=128 offset=32  0.8966 (+12.4%)
 **`shift_aug` 선택 근거** (실측 |rho|): 0칸 0.7399 / 1칸 0.7236 / 3칸 0.6647 /
 5칸 0.5656. 시간 매핑이 정확하므로 **1~2칸을 권장**한다.
 
-### 5b. 멀티태스크 변형 (정보량 2.1배)
-
-HW 하나만 예측하면 정보량 상한이 4.151비트다. sign/byte0/byte1/byte2로 나누면
-헤드 합이 8.736비트로 **2.10배**가 되고 필요한 트레이스가 5.5개에서 2.6개로 준다.
-
-```python
-extra = s2.precompute_multitask_labels(u_prof)     # sign, byte0, byte1, byte2
-train_mt = s2.CoefficientWindowSampler(Xp, hw, cm, train_idx, window=WINDOW,
-                                       window_offset=OFFSET, batch_size=512,
-                                       traces_per_batch=32, shift_aug=1, seed=0,
-                                       extra_labels=extra)
-mt = vm.compile_multitask(vm.build_multitask_model(window=WINDOW))
-```
-
-**주의**: byte0/byte1은 누설이 약하다(|rho| 0.24~0.30). 헤드끼리 정보가 겹치므로
-8.736비트가 그대로 실현되지 않는다. **반드시 PI와 실측 GE로 검증한다**(Step 6d).
-byte3은 사실상 8 x 부호비트라 기본 헤드에서 제외되어 있다.
-
 **주의사항**
 - `class_weight`를 쓰지 말 것. focal loss와 이중 적용되면 확률이 왜곡되고
   Step 6-2가 무너진다.
@@ -232,73 +214,32 @@ byte3은 사실상 8 x 부호비트라 기본 헤드에서 제외되어 있다.
 **통과 조건**: 검증 Top-1이 **8.68%를 크게 상회**할 것. 8.68% 근처면 학습이
 전혀 안 된 것이다(모델이 최빈 클래스만 답하는 상태).
 
+### 5b. 멀티태스크 변형 (정보량 상한 2.0배)
+
+HW 하나만 예측하면 정보량 상한이 4.2147비트다. sign/byte0/byte1/byte2로 나누면
+**결합 엔트로피 8.4157비트**로 1.997배가 되고, 완벽 모델 기준 필요 트레이스가
+5.46개에서 2.73개로 준다.
+
+주변 엔트로피의 단순 합(8.7853)을 쓰면 안 된다. 헤드가 완전히 독립일 때만
+성립하는 상한이고 실제로는 0.3696비트(4.2%)가 중복이다.
+
+```python
+extra = s2.precompute_multitask_labels(u_prof)     # sign, byte0, byte1, byte2
+train_mt = s2.CoefficientWindowSampler(Xp, hw, cm, train_idx, window=WINDOW,
+                                       window_offset=OFFSET, batch_size=512,
+                                       traces_per_batch=32, shift_aug=1, seed=0,
+                                       extra_labels=extra)
+mt = vm.compile_multitask(vm.build_multitask_model(window=WINDOW))
+```
+
+**중요: 헤드를 미리 쳐내지 말고 4개 전부로 학습한다.** 어떤 헤드를 쓸지는
+학습이 끝난 뒤 Step 6-e에서 이 모델의 실측치로 결정한다. 선형 프로브 기준으로는
+`sign` 단독이 가장 좋았지만, 그것은 프로브가 약한 바이트를 학습하지 못했기
+때문일 수 있다. **강한 CNN에서는 결론이 뒤집힐 수 있다.**
+
+byte3은 sign과 완전 중복이라(결합 엔트로피 기여 +0.0000비트) 기본 헤드에서 제외되어 있다.
+
 ---
-
-## Step 6. 평가 (3단계)
-
-```python
-import v3_report as rp, v3_evaluate as ev
-```
-
-### 6-1. 분류 성능
-
-```python
-POLY, COEFF = 0, 50
-u_atk = vc.load_array(DATASET, "attack_10000_u=cs.npy")
-atk_sampler = s2.CoefficientWindowSampler(Xa, s2.precompute_hw_labels(u_atk),
-                                          cm, np.arange(vc.N_ATTACK), window=32,
-                                          batch_size=512, traces_per_batch=32,
-                                          shift_aug=0, seed=2)
-probs = vm.predict_coefficient_probs(model, atk_sampler,
-                                     np.arange(vc.N_ATTACK), POLY, COEFF)
-y_atk = vc.hw32(u_atk[:, POLY, COEFF]).astype(np.int64)
-cls_atk = rp.classification_report(probs, y_atk, label="공격셋")
-```
-
-검증셋에 대해서도 같은 방식으로 `cls_val`을 만든다.
-**두 값의 차이가 이식성 격차다** (v2는 4.5%p였다).
-
-### 6-1b. 계수별 편차 (계수 불변 모델의 핵심 검증)
-
-```python
-pairs = [(j, k) for j in range(4) for k in range(0, 256, 32)]
-def predict_fn(j, k):
-    p = vm.predict_coefficient_probs(model, atk_sampler, np.arange(2000), j, k)
-    return p, vc.hw32(u_atk[:2000, j, k]).astype(np.int64)
-per_coeff, coeff_rows = rp.per_coefficient_report(predict_fn, pairs)
-```
-
-**통과 조건**: 표준편차 5% 미만. 크면 시간 매핑이 일부 계수에서 어긋난 것이다.
-
-### 6-2. 캘리브레이션
-
-```python
-rng  = np.random.default_rng(7)
-perm = rng.permutation(len(y_atk))
-cal, atk = perm[:3000], perm[3000:]          # 캘리브레이션 / 평가 분리
-calib = rp.calibration_report(probs[atk], y_atk[atk])
-```
-
-**통과 조건**: ECE 0.10 미만. 크면 확률이 부정확해 Step 6-3이 신뢰할 수 없다.
-
-### 6-3. 키 복구
-
-```python
-c_atk  = np.asarray(vc.load_array(DATASET, "attack_10000_c.npy"), dtype=np.int64)
-s_true = vc.load_array(DATASET, "attack_s.npy")
-attack = rp.attack_report(probs[cal], y_atk[cal], probs[atk], c_atk[atk],
-                          COEFF, POLY, int(s_true[POLY, COEFF]),
-                          u_true=np.asarray(u_atk)[atk],
-                          n_candidates=65536, n_experiments=100, max_traces=40)
-```
-
-**해석 기준**: 완벽 오라클은 6개 트레이스에서 SR 100%에 도달한다.
-어떤 모델도 이보다 잘할 수 없다. `efficiency`가 그 비율이다.
-
-**절대 하지 말 것**
-- 후보군을 `attack_s.npy`에서 만들지 말 것 (v2의 치명적 오류, 32,736배 축소)
-- 온도를 공격셋에서 고르지 말 것
-- 동점 처리를 빼지 말 것 (GE가 0으로 붕괴해 성공한 것처럼 보인다)
 
 ### 5c. 앙상블 (선택)
 
@@ -384,6 +325,72 @@ PI가 낮으면 채택하지 않는다.
 역산해 쓴다. 학습용 후보에 정답을 포함하는 것은 지도학습 라벨에 해당하므로
 정당하다 — **평가용 후보는 반드시 `v3_evaluate.build_candidate_residues()`** 를 쓴다.
 
+## Step 6. 평가 (3단계)
+
+```python
+import v3_report as rp, v3_evaluate as ev
+```
+
+### 6-1. 분류 성능
+
+```python
+POLY, COEFF = 0, 50
+u_atk = vc.load_array(DATASET, "attack_10000_u=cs.npy")
+atk_sampler = s2.CoefficientWindowSampler(Xa, s2.precompute_hw_labels(u_atk),
+                                          cm, np.arange(vc.N_ATTACK), window=32,
+                                          batch_size=512, traces_per_batch=32,
+                                          shift_aug=0, seed=2)
+probs = vm.predict_coefficient_probs(model, atk_sampler,
+                                     np.arange(vc.N_ATTACK), POLY, COEFF)
+y_atk = vc.hw32(u_atk[:, POLY, COEFF]).astype(np.int64)
+cls_atk = rp.classification_report(probs, y_atk, label="공격셋")
+```
+
+검증셋에 대해서도 같은 방식으로 `cls_val`을 만든다.
+**두 값의 차이가 이식성 격차다** (v2는 4.5%p였다).
+
+### 6-1b. 계수별 편차 (계수 불변 모델의 핵심 검증)
+
+```python
+pairs = [(j, k) for j in range(4) for k in range(0, 256, 32)]
+def predict_fn(j, k):
+    p = vm.predict_coefficient_probs(model, atk_sampler, np.arange(2000), j, k)
+    return p, vc.hw32(u_atk[:2000, j, k]).astype(np.int64)
+per_coeff, coeff_rows = rp.per_coefficient_report(predict_fn, pairs)
+```
+
+**통과 조건**: 표준편차 5% 미만. 크면 시간 매핑이 일부 계수에서 어긋난 것이다.
+
+### 6-2. 캘리브레이션
+
+```python
+rng  = np.random.default_rng(7)
+perm = rng.permutation(len(y_atk))
+cal, atk = perm[:3000], perm[3000:]          # 캘리브레이션 / 평가 분리
+calib = rp.calibration_report(probs[atk], y_atk[atk])
+```
+
+**통과 조건**: ECE 0.10 미만. 크면 확률이 부정확해 Step 6-3이 신뢰할 수 없다.
+
+### 6-3. 키 복구
+
+```python
+c_atk  = np.asarray(vc.load_array(DATASET, "attack_10000_c.npy"), dtype=np.int64)
+s_true = vc.load_array(DATASET, "attack_s.npy")
+attack = rp.attack_report(probs[cal], y_atk[cal], probs[atk], c_atk[atk],
+                          COEFF, POLY, int(s_true[POLY, COEFF]),
+                          u_true=np.asarray(u_atk)[atk],
+                          n_candidates=65536, n_experiments=100, max_traces=40)
+```
+
+**해석 기준**: 완벽 오라클은 6개 트레이스에서 SR 100%에 도달한다.
+어떤 모델도 이보다 잘할 수 없다. `efficiency`가 그 비율이다.
+
+**절대 하지 말 것**
+- 후보군을 `attack_s.npy`에서 만들지 말 것 (v2의 치명적 오류, 32,736배 축소)
+- 온도를 공격셋에서 고르지 말 것
+- 동점 처리를 빼지 말 것 (GE가 0으로 붕괴해 성공한 것처럼 보인다)
+
 ### 6-d. 학습 방식 간 효율 비교 (PI)
 
 여러 학습 방식을 시도했다면 **PI(Perceived Information)** 로 비교한다.
@@ -422,30 +429,8 @@ mm = bm.evaluate_multitask_variant(vm_, head_probs, head_labels,
 all_metrics.append(mm)
 ```
 
-**헤드 선택은 단독 PI_h가 아니라 한계 기여로 한다.** 헤드끼리 정보가 겹치면
-단독 PI가 양수여도 넣으면 손해일 수 있다. 실측 예: `byte2`는 단독 PI_h가
-+0.241인데 한계 기여는 **-0.140**이다(sign과 0.366비트 중복).
-
-```python
-# 반드시 캘리브레이션셋에서. 공격셋으로 고르면 테스트셋 튜닝이다.
-chosen = bm.select_heads(head_probs_cal, head_labels_cal)
-print(chosen["heads"])            # 예: ['sign']
-print(bm.head_ablation(head_probs_cal, head_labels_cal))
-```
-
-선형 프로브 실측에서는 **헤드가 적을수록 좋았다.**
-
-| 헤드 조합 | 결합 PI | 예측 트레이스 |
-|---|---|---|
-| **sign 단독** | **0.660** | **34.8** |
-| sign+byte2 | 0.535 | 43.0 |
-| sign+byte0~2 (4헤드) | 0.436 | 52.7 |
-| (비교) HW 단독 라벨 | 0.401 | 57.4 |
-
-byte0/byte1은 누설이 가장 약해(|rho| 0.24~0.29) 학습에 실패했다. 결합 엔트로피
-8.416비트 중 5.09비트가 이 둘에 몰려 있으므로 멀티태스크 이득은 여기서 갈린다.
-강한 CNN이 이를 학습해내면 결론이 달라질 수 있으니 반드시 직접 확인한다.
-제외할 헤드는 `compile_multitask(loss_weights=...)`에서 가중치를 낮추거나 뺀다.
+멀티태스크 리포트에는 **헤드 분해 표**(단독 PI_h, 한계 기여, "빼면?" 판정)가
+들어간다. **어느 헤드를 쓸지는 여기서 정하지 말고 Step 6-e에서 결정한다.**
 
 **앙상블을 멀티태스크로 구성할 때**는 헤드별로 결합한다. 멤버마다 잘하는 헤드가
 다르기 때문이다(실측: sign은 넓은 창 멤버에 가중치 0.966이 몰렸지만,
@@ -473,8 +458,110 @@ mm = bm.evaluate_multitask_ensemble_variant(v, member_head_probs_atk, head_label
   정보를 주는 게 아니라 뺏고 있다. 정확도로는 이 상태가 안 보인다.
 - `pi_ratio` = PI / H(Y). 그 라벨의 이론적 상한에 얼마나 근접했는지다.
 
-기준값: HW 라벨의 H(Y)=4.151비트, 멀티태스크 헤드 합 8.736비트.
-완벽 오라클은 HW로 6개, 바이트별로 약 3개 트레이스다.
+기준값 (라벨 자체의 정보량 상한, 공격셋 u 전량 10,240,000 샘플 실측):
+
+| 라벨 | 엔트로피 | 완벽 모델의 필요 트레이스 |
+|---|---|---|
+| HW 단독 (33클래스) | 4.2147 | 5.46 |
+| 멀티태스크 결합 (4헤드) | 8.4157 | 2.73 |
+
+주변 엔트로피의 합(8.7853)은 헤드가 완전히 독립일 때만 성립하는 상한이므로
+쓰지 않는다. 실제 중복이 0.3696비트(4.2%)다.
+
+---
+
+### 6-e. 강한 CNN 기준 헤드 재선택 (멀티태스크를 쓴 경우 필수)
+
+**기존 헤드 결론을 그대로 물려받지 말 것.** 지금까지 기록된
+"`sign` 단독이 최선"은 **선형 프로브로 잰 값**이며, 그 프로브가 byte0/byte1을
+전혀 학습하지 못한 결과일 가능성이 크다. 결합 엔트로피 8.4157비트 중 **5.09비트가
+byte0/byte1에 있으므로**, CNN이 이 둘을 학습해내면 결론이 뒤집힌다.
+이 단계의 목적은 그것을 실제 모델로 판정하는 것이다.
+
+#### 절차
+
+```python
+import v3_benchmark as bm
+
+# 1) 헤드 4개 전부로 학습된 모델에서 헤드별 확률을 뽑는다 (미리 쳐내지 않았어야 한다)
+head_probs = {h: mt.predict(X_windows, verbose=0)[i]
+              for i, h in enumerate(mt.output_names)}
+head_labels = {h: bm.SCHEMES[h](u_atk_sel).astype("int64") for h in head_probs}
+
+# 2) 헤드별 온도 보정 (반드시 캘리브레이션셋에서)
+import v3_evaluate as ev
+for h in head_probs:
+    T, _ = ev.fit_temperature(head_probs[h][cal], head_labels[h][cal])
+    head_probs[h] = ev.apply_temperature(head_probs[h], T)
+    print(f"  {h}: T={T:.2f}")     # T가 0.05나 30에 닿으면 그리드 경계 문제다
+
+# 3) 한계 기여로 판정 (단독 PI가 아니다)
+abl = bm.head_ablation({h: p[cal] for h, p in head_probs.items()},
+                       {h: y[cal] for h, y in head_labels.items()})
+for h, d in abl["heads"].items():
+    print(f"  {h}: 한계 기여 {d['marginal']:+.3f}  "
+          f"{'빼는 게 이득' if d['drop_is_better'] else '유지'}")
+
+# 4) 탐욕적 선택 — 반드시 캘리브레이션셋에서
+chosen = bm.select_heads({h: p[cal] for h, p in head_probs.items()},
+                         {h: y[cal] for h, y in head_labels.items()})
+print("선택된 헤드:", chosen["heads"])
+```
+
+#### 판정 기준
+
+선형 프로브가 남긴 기준선이다. **CNN이 이 값을 넘는지가 핵심 질문이다.**
+
+| 항목 | 선형 프로브 | CNN이 이러면 결론이 바뀐다 |
+|---|---|---|
+| byte0 Top-1 | 28.03% | 유의미하게 상회 |
+| byte1 Top-1 | 27.59% | 유의미하게 상회 |
+| byte0 한계 기여 | -0.058 | **양수** |
+| byte1 한계 기여 | -0.053 | **양수** |
+| byte2 한계 기여 | -0.140 | **양수** |
+| 최선 조합 결합 PI | 0.660 (`sign` 단독) | 4헤드가 이보다 높으면 4헤드 채택 |
+
+- **한계 기여가 양수인 헤드는 모두 유지한다.** 단독 PI_h가 양수라도 한계 기여가
+  음수면 뺀다(byte2가 실제로 그 사례였다: 단독 +0.241, 한계 -0.140).
+- `select_heads`가 4헤드를 그대로 유지하면, 멀티태스크가 제 값을 하는 것이다.
+  이때 예측 트레이스가 HW 단독(5.46) 쪽으로 크게 줄어드는지 확인한다.
+- `sign` 단독으로 다시 수렴하면, **CNN도 약한 바이트를 학습하지 못한 것**이다.
+  이 경우 멀티태스크를 포기하기 전에 다음을 먼저 시도한다.
+  - `compile_multitask(loss_weights=...)`로 약한 헤드의 가중치를 **올려** 본다
+  - 윈도우를 넓혀 본다(byte0/byte1의 누설 지점이 다른 곳일 수 있다)
+  - 앙상블과 결합해 본다. 실측에서 앙상블이 약한 헤드를 특히 보강했다
+    (byte0 가중치가 disjoint 멤버들로 퍼짐)
+
+#### 학습용 헤드와 공격용 헤드는 다를 수 있다
+
+이 구분을 놓치기 쉽다.
+
+- **학습용**: 손실에 들어가는 헤드. 약한 헤드도 공유 트렁크에 유용한 보조 신호를
+  줄 수 있어 남겨두는 편이 나을 수 있다.
+- **공격용**: 로그우도를 합산할 헤드. 여기서는 한계 기여가 음수인 헤드를 뺀다.
+
+즉 **4헤드로 학습하고 선택된 부분집합으로 공격**하는 구성이 가능하며,
+대개 이쪽이 낫다. 헤드를 아예 빼고 재학습하는 것은 `select_heads` 결과가
+안정적으로 같은 답을 줄 때만 한다. 두 방식을 모두 벤치마크에 올려 비교한다.
+
+```python
+# 학습은 4헤드, 공격은 선택된 부분집합
+hs = chosen["heads"]
+v = bm.Variant(f"멀티태스크 4헤드 학습 / {'+'.join(hs)} 공격", "", window=WINDOW)
+bm.evaluate_multitask_variant(v, {h: head_probs[h][atk] for h in hs},
+                              {h: head_labels[h][atk] for h in hs}, head_names=hs)
+```
+
+#### 통과 조건
+
+- 헤드별 온도가 그리드 경계(0.05 또는 30)에 닿지 않을 것
+- 선택된 조합의 결합 PI가 **HW 단독 라벨보다 높을 것**. 낮으면 멀티태스크를
+  쓸 이유가 없으므로 HW 단독으로 돌아간다.
+- 결과를 `evaluate_multitask_variant`로 벤치마크에 올려 다른 방식과 함께 기록
+
+**결과를 기록할 것.** 선형 프로브 기준선을 CNN 실측치로 갱신해야 이후 실험의
+기준이 된다. 갱신 대상은 `instruction_v3.md` 10.3절과
+`v3_benchmark.MULTITASK_REFERENCE`다.
 
 ---
 
@@ -513,3 +600,6 @@ rp.save_json(f"{WORK}/v3_report.json", {"meta": meta, "cls_atk": cls_atk,
 | 검증-공격 격차 큼 | `vertical_source="own"` 확인, Step 4 이식성 재측정 |
 | 메모리 부족 | `traces_per_batch` 축소, memmap이 float16인지 확인 |
 | 학습이 느림 | Metal 인식 여부, `traces_per_batch`(지역성), XLA off 확인 |
+| 멀티태스크가 HW 단독보다 나쁨 | Step 6-e로 헤드 재선택. 한계 기여가 음수인 헤드를 공격에서 뺀다 |
+| `select_heads`가 `sign` 단독으로 수렴 | CNN도 약한 바이트 학습 실패. 약한 헤드 `loss_weights` 상향, 윈도우 확대, 앙상블 결합을 먼저 시도 |
+| 헤드 온도가 0.05나 30에 닿음 | 그리드 경계 문제. 보정이 덜 된 상태라 PI가 왜곡된다 |
