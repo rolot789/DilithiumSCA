@@ -604,7 +604,7 @@ AUTO 블록 **안의 내용을 손으로 고치지 말 것.** 다음 호출에�
 
 ```python
 meta = {
-    "모델": "coefficient-invariant CNN (window=32)",
+    "모델": f"coefficient-invariant CNN (window={WINDOW}, offset={OFFSET})",
     "학습 샘플": f"{train.samples_per_epoch():,}",
     "정규화": cfg.describe(),
     "검증 분할": "leave-one-set-out (set4)",
@@ -617,9 +617,49 @@ path = rp.render_markdown(f"{WORK}/v3_report.md", meta, cls_val, cls_atk,
 rp.save_json(f"{WORK}/v3_report.json", {"meta": meta, "cls_atk": cls_atk,
                                         "calib": calib, "attack": attack,
                                         "per_coeff": per_coeff, "portability": port})
+
+# 학습 방식을 여러 개 비교했다면 벤치마크도 함께
+bm.render_benchmark(f"{WORK}/benchmark.md", all_metrics)
 ```
 
-리포트를 사용자에게 보여주고, **미실행/미달 항목을 명확히 구분해서** 요약한다.
+### 7b. 문서 동기화 (마지막, 항상 실행)
+
+```python
+bm.sync_docs()      # instruction_v3.md 10.3절 + README.md 5.4절
+```
+
+레포의 사양서와 README에 있는 **헤드 실측값 AUTO 블록**을 현재
+`head_baseline.json`과 맞춘다. Step 6-e에서 `baseline_from_ablation()`을
+호출했다면 이미 갱신되어 있지만, **항상 한 번 더 실행한다.** 이유는 두 가지다.
+
+- 멱등이라 부작용이 없다. 이미 맞으면 "변경 없음"만 출력한다.
+- 누군가 AUTO 블록 안을 손으로 고쳤거나, 다른 경로로 기준값이 바뀐 경우를 잡는다.
+
+출력이 "갱신"으로 나오면 **문서가 실제로 바뀐 것이므로 커밋 대상**이다.
+사용자에게 어느 파일이 바뀌었는지 알린다.
+
+```
+갱신: .../instruction_v3.md      <- 커밋 필요
+변경 없음: .../README.md
+```
+
+`AUTO:head-baseline` 마커가 없는 문서는 조용히 건너뛴다. 마커 바깥의 손으로 쓴
+설명은 절대 건드리지 않는다.
+
+### 7c. 마무리 점검
+
+리포트를 사용자에게 보여주고 다음을 명확히 구분해 요약한다.
+
+- **미실행 항목** — 수치를 지어내지 말고 "미실행"으로 남긴다
+- **미달 항목** — 통과 조건을 못 넘은 단계
+- **문서 갱신 여부** — `sync_docs()`가 바꾼 파일 목록
+- **기준값 출처** — `head_baseline.json`의 `source`가 아직 `linear_probe`면,
+  CNN 실측치로 갱신되지 않았다는 뜻이므로 그 사실을 반드시 알린다
+
+```python
+b = bm.load_head_baseline()
+print("헤드 기준값 출처:", b["source"], "| 선택된 헤드:", b["chosen_heads"])
+```
 
 ---
 
