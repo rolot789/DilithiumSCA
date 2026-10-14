@@ -95,9 +95,9 @@ def per_coefficient_report(predict_fn, poly_coeff_pairs, verbose=True):
               f"p5 {summary['pi_p5']:.3f}, 최소 {summary['pi_min']:.3f}")
         if summary["n_pi_nonpositive"]:
             print(f"  >> PI<=0인 계수 {summary['n_pi_nonpositive']}개. "
-                  f"그 계수는 복구 불가이므로 전체 키가 완성되지 않는다.")
+                  f"현재 확률 모델의 PI 기반 추정이 부족하다 (복구 불가능의 증명 아님).")
         if summary["std"] > 0.05:
-            print("  >> 정확도 편차가 크다. 시간 매핑이 일부 계수에서 어긋났을 수 있다.")
+            print("  >> 정확도 편차가 크다. 시간 매핑·위치별 문맥·누설 세기를 진단할 것.")
     return summary, rows
 
 
@@ -163,6 +163,7 @@ def attack_report(probs_cal, y_cal, probs_atk, c_vals_atk, coeff_k, poly_j,
     }
     if np.any(sr >= 1.0):
         rep["traces_to_sr100"] = int(np.argmax(sr >= 1.0)) + 1
+    # 하위 호환 필드명: 정확한 GE=0이 아니라 GE<=0.5 최초 도달 시점이다.
     if np.any(ge <= 0.5):
         rep["traces_to_ge0"] = int(np.argmax(ge <= 0.5)) + 1
 
@@ -232,15 +233,15 @@ def render_markdown(out_path, meta, cls_val, cls_atk, calib, attack,
               f"p5 {per_coeff['pi_p5']:.3f}, 최소 {per_coeff['pi_min']:.3f}")
         if per_coeff.get("n_pi_nonpositive"):
             A(f"- **PI<=0인 계수 {per_coeff['n_pi_nonpositive']}개.** "
-              f"그 계수는 복구되지 않으므로 전체 키가 완성되지 않는다.")
+              f"현재 확률 모델의 PI 기반 유한 추정이 불가능하며, 복구 불가능의 증명은 아니다.")
         if per_coeff["std"] > 0.05:
-            A("- **편차가 크다.** 시간 매핑이 일부 계수에서 어긋났을 수 있다.")
+            A("- **편차가 크다.** 시간 매핑·위치별 문맥·누설 세기를 추가 진단해야 한다.")
         else:
-            A("- 정확도 편차는 작다. 계수 불변 모델이 균일하게 동작한다.")
+            A("- 측정한 계수 표본의 정확도 편차는 작다. 미측정 계수의 균일성은 별도 검증이 필요하다.")
         A("")
 
     if full_key:
-        A("### 2.2 전체 키(1024계수) 복구\n")
+        A("### 2.2 PI 기반 필요 트레이스 추정 (전체 키 실측 아님)\n")
         A("**단일 계수 성능은 전체 키 난이도를 과소평가한다.** 비밀키는 1024개가")
         A("전부 복구되어야 완성이고, 복구 시점은 가장 약한 계수가 결정한다.")
         A("게다가 누설이 계수 인덱스 k에 따라 물리적으로 약해진다")
@@ -250,12 +251,13 @@ def render_markdown(out_path, meta, cls_val, cls_atk, calib, attack,
         A(f"- 필요 트레이스: 중앙값 계수 **{full_key['traces_median_coeff']:.0f}**, "
           f"p95 계수 **{full_key['traces_p95_coeff']:.0f}**")
         if np.isfinite(full_key["traces_full_key"]):
-            A(f"- **전체 키 복구: {full_key['traces_full_key']:.0f} 트레이스**")
+            A(f"- 표본 최악 PI 기반 필요 트레이스 추정: "
+              f"**{full_key['traces_full_key']:.2f}** (1024계수 동시 복구 검증 아님)")
         else:
-            A(f"- **전체 키 복구 불가** — PI<=0인 계수가 표본에 "
-              f"{full_key['n_unrecoverable_sampled']}개 있다")
+            A(f"- PI 기반 유한 추정 불가 — PI<=0인 계수가 표본에 "
+              f"{full_key['n_unrecoverable_sampled']}개 있다. 복구 불가능의 증명은 아니다.")
         A("")
-        A("| 트레이스 수 | 미복구 계수 | 복구율 |")
+        A("| 트레이스 수 | 휴리스틱 미복구 계수 추정 | 휴리스틱 복구율 추정 |")
         A("|---|---|---|")
         for c in full_key["curve"]:
             A(f"| {c['n_traces']} | {c['unrecovered']:.0f} | "
@@ -275,8 +277,8 @@ def render_markdown(out_path, meta, cls_val, cls_atk, calib, attack,
     A("## 4. 키 복구 성능\n")
     A(f"- 후보 공간: {attack['n_candidates']:,}개 (전체 q={attack['full_space']:,}, "
       f"환산 배율 x{attack['scale_factor']:.1f})")
-    A(f"- **후보군은 정답 키 파일과 무관하게 생성**했다 (v2는 정답에서 뽑아 "
-      f"32,736배 축소된 상태로 측정했다)")
+    A("- GE/SR은 후보 표본 기준이다. 전체공간 환산 GE=0도 표본 밖 후보 배제의 증명이 아니다.")
+    A("- 다른 후보는 균등 난수로 생성하고, 정답은 채점 대상 지정과 표본 내 포함을 위해 삽입했다.")
     A(f"- 학습된 온도 T={attack['temperature']:.3f} (캘리브레이션셋 전용, 공격셋 미사용)")
     A("")
     A("| 트레이스 수 | GE (부분집합) | GE (전체공간 환산) | SR |")
@@ -288,11 +290,11 @@ def render_markdown(out_path, meta, cls_val, cls_atk, calib, attack,
     A("")
     A(f"- **SR 100% 도달: {attack['traces_to_sr100'] or '미도달'} 트레이스**")
     if "oracle_traces_to_sr100" in attack:
-        A(f"- 완벽 오라클(HW를 100% 맞히는 이론적 상한): "
+        A(f"- 완벽 오라클(HW를 100% 맞히는 후보 표본 기준선): "
           f"{attack['oracle_traces_to_sr100']} 트레이스")
         if "efficiency" in attack:
-            A(f"- **효율 {attack['efficiency']*100:.0f}%** "
-              f"(1.0에 가까울수록 이론적 한계에 근접)")
+            A(f"- 오라클/모델의 관측 SR100 도달 트레이스 비율: "
+              f"{attack['efficiency']*100:.0f}% (절대적인 이론적 효율은 아님)")
     A("")
 
     if portability:
@@ -315,10 +317,10 @@ def render_markdown(out_path, meta, cls_val, cls_atk, calib, attack,
         checks.append((per_coeff["std"] < 0.05,
                        f"계수별 표준편차 {per_coeff['std']*100:.2f}% < 5%"))
         checks.append((not per_coeff.get("n_pi_nonpositive"),
-                       "모든 표본 계수의 PI > 0 (복구 불가 계수 없음)"))
+                       "모든 표본 계수의 PI > 0 (전체 키 복구 보증 아님)"))
     if full_key:
         checks.append((np.isfinite(full_key["traces_full_key"]),
-                       "전체 키 1024계수 복구 가능"))
+                       "PI 기반 표본 최악 필요 트레이스 추정값이 유한함 (전체 키 실측 아님)"))
     for ok, txt in checks:
         A(f"- {'[통과]' if ok else '[미달]'} {txt}")
     A("")

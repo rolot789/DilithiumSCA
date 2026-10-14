@@ -147,10 +147,10 @@ def guessing_entropy(log_lik, c_vals, coeff_k, cands, true_idx,
 
 def perfect_oracle_curve(u_true, c_vals, coeff_k, poly_j, cands, true_idx,
                          n_experiments=100, max_traces=16, seed=0):
-    """HW를 100% 맞히는 오라클의 GE. 모델 성능의 상한(정보이론적 하한 트레이스 수).
+    """HW를 100% 맞히는 오라클의 후보 표본 GE 기준선.
 
-    실측상 이 값은 4개 트레이스 근처에서 0으로 떨어진다. 어떤 모델도 이보다
-    적은 트레이스로 복구할 수 없으므로, v3 성능은 항상 이 곡선과 함께 보고한다.
+    필요한 트레이스 수는 후보 표본·seed·실험 조건에 따라 달라진다.
+    관측된 SR100 도달 시점을 개별 실험의 절대 하한으로 해석하지 않는다.
     """
     rng = np.random.default_rng(seed)
     n_pool = len(c_vals)
@@ -167,13 +167,13 @@ def perfect_oracle_curve(u_true, c_vals, coeff_k, poly_j, cands, true_idx,
 
 def full_key_metrics(per_coeff_pi, key_bits=None, n_coefficients=1024,
                      trace_grid=None, verbose=True):
-    """전체 키(1024계수) 복구 지표. **계수 하나만 재면 난이도를 과소평가한다.**
+    """PI로부터 계산한 필요 트레이스 휴리스틱. 전체 키 복구 실측이 아니다.
 
     비밀키는 계수 1024개가 **전부** 복구되어야 완성이다. 계수마다 누설 강도가
     다르므로 전체 복구 시점은 **가장 약한 계수**가 결정한다.
 
     실측(선형 프로브, 계수 256개 표본)에서 계수별 PI는 다음과 같이 퍼져 있었다.
-        중앙값 0.956   p5 0.479   최소 -0.070(복구 불가)
+        중앙값 0.956   p5 0.479   최소 -0.070(PI 기반 유한 추정 불가)
     필요 트레이스로 환산하면 중앙값 24개인데 p5는 48개, 최악은 무한대다.
 
     더구나 누설이 계수 인덱스 k에 따라 **물리적으로 약해진다**(|rho| 0.721 -> 0.611).
@@ -182,7 +182,9 @@ def full_key_metrics(per_coeff_pi, key_bits=None, n_coefficients=1024,
     **단일 계수 수치는 전체 키 기준으로 낙관 편향**이다.
 
     per_coeff_pi : 계수별 PI 배열(표본이어도 된다). 전체 1024개로 외삽한다.
-    반환         : 트레이스 수별 미복구 계수 기대값과 전체 복구 지점
+    반환         : kb/PI를 임계값으로 삼은 휴리스틱 곡선과 표본 최악 추정값.
+    PI<=0은 이 확률 모델의 PI가 부족하다는 뜻이며 복구 불가능의 증명이 아니다.
+    양의 PI와 표본 외삽도 실제 전체 후보·계수의 동시 복구를 보증하지 않는다.
     """
     pi = np.asarray(per_coeff_pi, dtype=np.float64)
     kb = key_bits if key_bits is not None else KEY_BITS
@@ -220,10 +222,11 @@ def full_key_metrics(per_coeff_pi, key_bits=None, n_coefficients=1024,
         print(f"  필요 트레이스: 중앙값 계수 {rep['traces_median_coeff']:.0f}, "
               f"p95 계수 {rep['traces_p95_coeff']:.0f}")
         if np.isfinite(rep["traces_full_key"]):
-            print(f"  **전체 키 복구: {rep['traces_full_key']:.0f} 트레이스**")
+            print(f"  PI 기반 표본 최악 필요 트레이스 추정: "
+                  f"{rep['traces_full_key']:.2f} (전체 키 실측 아님)")
         else:
-            print(f"  **전체 키 복구 불가** — PI<=0 인 계수가 표본에 "
-                  f"{rep['n_unrecoverable_sampled']}개 있다")
+            print(f"  PI 기반 유한 추정 불가 — PI<=0 인 계수가 표본에 "
+                  f"{rep['n_unrecoverable_sampled']}개 있다 (복구 불가능의 증명 아님)")
         print(f"  (단일 계수만 재면 이 값이 아니라 중앙값 쪽을 보게 되어 "
               f"난이도를 과소평가한다)")
     return rep

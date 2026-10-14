@@ -86,7 +86,9 @@ def make_optimizer(learning_rate=1e-3):
     if is_apple_silicon():
         try:
             return tf.keras.optimizers.legacy.Adam(learning_rate=learning_rate)
-        except AttributeError:
+        # Keras 3에서는 legacy 네임스페이스가 존재해도 실제 생성 시
+        # ImportError를 낸다. 그 경우 표준 Adam으로 안전하게 대체한다.
+        except (AttributeError, ImportError):
             pass
     return tf.keras.optimizers.Adam(learning_rate=learning_rate)
 

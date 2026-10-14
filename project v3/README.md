@@ -7,6 +7,26 @@
 설계 사양과 실측 로그는 `instruction_v3.md`에 있다. 이 문서는 그것을 읽기 위한
 배경 설명이자, 코드를 직접 돌리기 위한 안내서다.
 
+## 현재 실행 상태 (2026-10-14 재검증)
+
+v3 단일 HW 헤드 학습과 실제 공격 캠페인 추론을 2026-09-23 완료했다.
+
+- 학습: Apple M5 Pro Metal GPU, 44/50 epoch에서 조기 종료, best epoch 36.
+- 최고 학습 validation: loss 1.127164, Top-1 67.926%, Top-3 96.442%.
+- 공격 캠페인 102,400개 계수 윈도우 표본: Top-1 66.625%, Top-3 96.190%.
+- 대표 계수 `(poly0, coeff50)`의 공격 트레이스 10,000개: Top-1 69.87%.
+- 후보 표본 65,254개에서 대표 계수 SR 100% 도달: 8트레이스, 100회 실험.
+- 저장 확률 재계산·후보 랭킹 재현 등 18개 점검 통과. best/final의 레이어 가중치 49개가 전부 동일하다.
+
+전체 q 공간 완전 열거·1024계수 전체 키 복구는 미검증이다. 37개 계수의 PI에서 나온
+약 12.32트레이스는 휴리스틱 추정이며 실측 전체 복구 결과가 아니다.
+
+현재 수치와 한계는 [결과 보고서](results_report.md), 다음 실험 제안은
+[학습 개선 분석](training_improvements.md)과
+[선행 연구 비교](related_work_analysis.md)를 기준으로 읽는다. 선행 연구와의 비교는
+같은 데이터의 성능 순위가 아니며, 로컬 데이터의 원 배포본은 아직 확인되지 않았다. 아래 1~6절의
+초기 탐색·선형 프로브·합성 실험 수치는 실행된 CNN 결과와 구분해야 한다.
+
 ---
 
 ## 1. 이 프로젝트가 무엇을 하는가
@@ -209,7 +229,9 @@ HW=21 근처 (음수 무리)  8.28%
 
 실측해보니 트레이스 하나에 **서로 다른 값이 109개뿐**이다. 측정 장비의 해상도가
 그만큼 성기다는 뜻이다. 그래서 이 데이터를 int64(8바이트)로 저장한 것은 심한 낭비이고,
-float16(2바이트)으로 바꿔도 정보가 전혀 손실되지 않는다. v3가 이 변환을 한다.
+원본의 작은 정수는 float16으로 표현할 수 있지만, 필터링·정규화 후 실수 값을
+float16으로 저장하면 반올림 오차가 생긴다. v3는 저장에 float16을 사용하고
+모델 입력에는 float32를 사용한다. float16/float32 저장의 성능 동등성은 별도 A/B 과제다.
 
 ### 3.2 결정적인 사실: 한 트레이스 안에 1024개가 다 들어있다
 
@@ -254,7 +276,7 @@ v2는 실제로 작동하는 공격을 만들었다. 단일 트레이스 정확�
 
 문제는 다른 곳에 있었다.
 
-### 4.1 성적표가 조작되어 있었다 (가장 심각)
+### 4.1 정답 기반 후보군으로 키 복구 성능이 과대평가됐다
 
 키 복구 성능을 재는 코드가 이렇게 생겼다.
 
@@ -299,8 +321,9 @@ v2는 `T = 5.0`, 즉 **뭉툭하게** 만들었다. 그리고 그 값을 공격�
 (시험 문제를 보고 공부법을 정한 셈이다).
 
 정확도를 제어한 합성 모델로 제대로 실험해보니 학습되는 최적 온도는 **약 0.4**,
-즉 **날카롭게** 만드는 방향이었다. v2는 스스로 눈을 흐리게 하고 "잘 안 보이니
-사진을 50장 찍자"고 한 상태였다. 제대로 하면 10장 미만으로 충분하다.
+즉 **날카롭게** 만드는 방향이었다. 이는 합성 모델의 결과이며 실제 모델의
+온도나 필요 트레이스 수를 보장하지 않는다. 이번 실제 CNN은 전역 T=0.75,
+대표 계수 T=0.80을 profiling set4에서 선택했다.
 
 ### 4.4 POI가 250개가 아니라 4개였다
 
@@ -457,9 +480,10 @@ v2의 실패는 "조건을 만족하는 게 4개뿐인데 250개를 요청했더
 
 이렇게 하면 두 가지가 동시에 해결된다.
 
-- 학습 샘플이 **30,000개 → 30,720,000개(1024배)** 로 늘어난다.
-- 모델 하나가 1024개 계수를 전부 담당하므로 **전체 키 복구가 자동으로 따라온다.**
-  원래는 별도 단계(Stage 3)로 잡아뒀던 작업이 사라진다.
+- 학습 가능한 `(trace, poly, coeff)` 조합이 **30,000개 → 30,720,000개(1024배)** 로 늘어난다.
+  현 샘플러는 반복 추출하므로 epoch이 전체 조합의 1회 전수 순회는 아니다.
+- 모델 하나로 1024개 계수의 확률을 예측할 수 있다. 실제 전체 키 복구에는
+  약한 계수 진단과 모든 계수의 후보 랭킹 검증이 추가로 필요하다.
 
 이게 정말 되는지는 실측으로 확인해야 한다. 두 가지를 쟀다.
 
@@ -595,29 +619,33 @@ byte2는 단독 PI가 양수(+0.241)인데 한계 기여는 음수(-0.140)다. s
 ### 5.5 평가 — 정직한 성적표
 
 **후보 공간을 정답에서 만들지 않는다.** `build_candidate_residues()`는 시드를
-고정한 난수로 `[0, q)` 범위에서 후보를 뽑는다. 정답 키 파일은 후보 생성에
-전혀 쓰이지 않는다. 정답은 오직 "몇 등인지 매길 대상"으로만 삽입된다.
+고정한 난수로 `[0, q)` 범위에서 다른 후보를 뽑는다. 정답 키 파일은 평가 대상과
+정답 포함 여부를 지정할 때 사용하고, 정답 값들의 집합으로 다른 후보를 구성하지 않는다.
+GE/SR은 후보 표본 기준이며 `q/n_candidates` 환산 GE는 전체공간의 추정값이다.
 
 여기서 확인해야 할 수학적 문제가 하나 있었다. 실제 `attack_s.npy`의 값은
 -18,046,164 ~ 19,328,097 범위로 `q`보다 크다. 그렇다면 후보를 `q`개만 열거해도
 되는가?
 
-`MR(c × (s + q))`와 `MR(c × s)`가 같은지 실측했고, **같았다.** 수학적으로도
-`q × qinv ≡ 1 (mod 2^32)`에서 유도된다. 1024개 계수 × 2,000 트레이스를 전수
-검사했더니 불일치는 0.058%뿐이었고, 그 차이도 정확히 ±q인 오버플로 경계 사례였다.
-따라서 **후보 공간은 q개가 맞다.**
+수학적 모듈러 관계와 구현의 signed MR 출력은 구분해야 한다. 이전
+1024계수 × 2,000트레이스 검사에서는 대표원 변경에 따른 불일치가 약 0.058%였다.
+이번 전체 공격 1,024만 값 재검산에서는 원래 정수 키의 MR은 라벨과 전부 일치했고,
+중심 잔여류로 바꾼 키의 MR 출력은 6,289개(0.061416%)에서 달랐다.
+현재 q개 잔여류 후보 모델은 이 차이를 포함한 근사다. 잔여류가 같아도
+32비트 HW가 항상 같지는 않으므로, 완전 복구 평가 전 대표원·overflow 규칙을 확인해야 한다.
 
 **동점을 반영한다.** 순위를 "나보다 높은 수 + 동점자 수 ÷ 2"로 계산한다.
 이것 하나로 완벽 오라클의 N=1 순위가 0에서 2,116으로 정상화된다.
 
 **보정을 공격셋과 분리한다.** 온도와 사전확률 보정은 별도의 캘리브레이션셋에서만
-학습한다. 시험지를 보고 공부법을 정하는 일이 구조적으로 불가능해진다.
+학습한다. 이번 실행에서는 profiling set4를 사용했으며, 이 set은 checkpoint 선택에도
+사용됐으므로 선택/calibration을 완전히 분리한 프로토콜은 아니다.
 `implicit_log_prior()`는 v2 보고서가 주장했지만 구현하지 않았던 사전확률 보정을
 실제로 수행한다.
 
 **완벽 오라클 기준선을 항상 같이 보고한다.** HW를 100% 맞히는 가상의 이상적
-모델이 몇 개의 트레이스를 필요로 하는지를 재둔 것이다. 어떤 모델도 이보다 잘할 수
-없으므로, 성능을 해석하는 절대 기준이 된다.
+모델이 후보 표본을 얼마나 빨리 구분하는지 비교하는 기준선이다.
+아래는 초기 탐색의 관측치이며 후보 표본·seed·반복 수에 따라 달라진다.
 
 ```
 N=1  GE=2116.4  SR=  0.0%
@@ -632,8 +660,9 @@ N=6  GE=   0.00 SR=100.0%
 즉 완벽 복구다. **SR(Success Rate)** 은 "몇 %의 실험에서 1위를 차지했는가"다.
 `N`은 사용한 트레이스 개수다.
 
-즉 **트레이스 1개가 주는 정보는 약 4비트이고, 후보 공간은 23비트이므로,
-어떤 모델도 6개 미만으로는 복구할 수 없다.**
+HW 엔트로피 약 4.21bit와 `log2(q)` 약 23bit의 비율은 평균적인 필요 트레이스의
+휴리스틱이다. **6개를 개별 실험의 절대 하한으로 해석하면 안 된다.** 이번
+실제 CNN 평가의 오라클은 후보 표본에서 5개 트레이스로 40/40회 성공했다.
 
 ---
 
@@ -650,10 +679,16 @@ N=6  GE=   0.00 SR=100.0%
 | `v3_ensemble.py` | 앙상블 결합(멀티태스크 포함), 다양성 진단, 스냅샷 앙상블 |
 | `v3_ranking.py` | Ranking Loss (구현했으나 실측상 비권장) |
 | `v3_report.py` | 3단계 평가 리포트 생성 |
+| `v3_train.py` | 학습 CLI, 배치/epoch 진행 로그, CSV·checkpoint 저장 |
+| `v3_infer.py` | 기존 단일 HW 모델의 공격 추론·온도 보정·후보 표본 GE/SR 평가 |
+| `v3_audit_results.py` | 저장 확률·CSV·MR 관계·레이어 가중치의 재검산 |
 | `v3_backend.py` | Apple Silicon 설정 (스레드, Metal, 정밀도) |
 | `time_map.json` | **1024개 계수 위치 실측 테이블** (실제 트레이스로 측정) |
 | `head_baseline.json` | **헤드별 실측 기준값** (모델에 따라 달라지므로 자동 갱신됨) |
 | `instruction_v3.md` | 설계 사양과 실측 로그 전문 |
+| `results_report.md` | 현재 CNN의 학습·추론 실측과 검증 범위 |
+| `training_improvements.md` | 근거에 따른 다음 학습 개선 제안 |
+| `related_work_analysis.md` | 실제 측정 기반 선행 연구·공개 데이터 비교와 후속 검증 설계 |
 
 ### 6.1 time_map.json이 왜 중요한가
 
@@ -680,137 +715,140 @@ poly1만 도중에 간격이 바뀐다. 직선 하나로는 못 맞춘다. 그�
 
 ## 7. 사용법
 
-### 7.1 설치
+### 7.1 실행 위치와 환경
+
+모든 명령은 **저장소 루트**에서 실행한다. 현재 로컬 `.venv-v3`는 Python 3.11.15,
+NumPy 1.26.4, TensorFlow/tensorflow-macos 2.16.2, tensorflow-metal 1.2.0으로
+학습·추론을 완료한 환경이다. 루트 `requirements.txt`는 이전 버전을 포함한 일반
+목록이며 v3 실행 환경의 잠금 파일이 아니다.
+
+새 Apple Silicon 환경에서 동일 주요 버전을 설치하는 예시는 다음과 같다.
 
 ```bash
-# Apple Silicon
-pip install tensorflow-macos tensorflow-metal
-pip install numpy scipy matplotlib scikit-learn tqdm
+python3.11 -m venv .venv-v3
+./.venv-v3/bin/python -m pip install \
+  numpy==1.26.4 tensorflow==2.16.2 tensorflow-macos==2.16.2 \
+  tensorflow-metal==1.2.0 scipy matplotlib scikit-learn tqdm h5py
 ```
 
-### 7.2 순서
+기존 환경이 있으면 다시 만들지 않는다. 실제 GPU 사용은 실행 로그의
+`GPU 디바이스 ['/physical_device:GPU:0']`와 Metal device 이름으로 확인한다.
 
-```python
-import sys; sys.path.insert(0, "project v3")
-import v3_common as vc, v3_normalize as nz, v3_stage2_data as s2
-import v3_model as vm, v3_evaluate as ev, v3_backend as bk
+### 7.2 입력과 기존 산출물
 
-# 0) 환경 설정 (numpy import 전에 하면 더 좋다)
-bk.configure_numpy_threads()
-bk.configure_tensorflow()
+기본 경로는 다음과 같다.
 
-# 1) 데이터 검증 게이트 — 여기를 통과 못 하면 진행하지 않는다
-vc.verify_dataset("../Dataset")
+- 원본 데이터: `Dataset/1-Dataset/` (profiling 4세트·attack·라벨·challenge·채점용 키).
+- 정규화 데이터: `artifacts/v3/prof_norm.npy` / `attack_norm.npy`.
+- 시간 매핑: `project v3/time_map.json`.
+- 기존 모델: `artifacts/v3/training_single/best.keras` / `final.keras`.
 
-# 2) 정규화된 float16 memmap 생성 (12.2GB -> 3.2GB, 한 번만)
-cfg = nz.NormConfig()          # 기본값: MA=7, gain=mad, vertical=own
-factory = lambda: vc.iter_profiling_traces("../Dataset")
-s2.build_normalized_memmap(factory, "prof_norm.npy", cfg, vc.N_PROFILING)
+정규화 memmap은 profiling `(40000,40000)`, attack `(10000,40000)`의 float16이며
+약 3.2GB / 0.8GB다(십진 GB). 학습·추론 CLI는 기존 memmap을 사용하며 전처리를
+자동 재생성하지 않는다. 원본 데이터·memmap·모델은 로컬 산출물이므로 저장소
+복제만으로 제공되지 않는다.
 
-# 3) 시간 매핑 로드 (실측 테이블)
-centers = s2.build_time_map(vc.load_time_map("time_map.json"))
+전처리 구현은 `v3_normalize.NormConfig`와
+`v3_stage2_data.build_normalized_memmap`을 참고한다. 기존 memmap에 생성 config·통계
+manifest가 없으므로, 기본 설정만 보고 당시 전처리 provenance가 완전히 재현됐다고
+간주하지 않는다. 재생성 시 별도 파일명과 train-only 통계 또는 명시된 캠페인 적응
+정책을 사용한다.
 
-# 4) 샘플러 — 1024개 계수 전부 사용
-import numpy as np
-X = np.load("prof_norm.npy", mmap_mode="r")
-u = vc.load_array("../Dataset", "profiling_40000_u=cs.npy")
-hw = s2.precompute_hw_labels(u)
-train_idx, val_idx = s2.set_split_indices(val_set=4)
+### 7.3 학습 재실행
 
-WINDOW, OFFSET = 96, 24        # 실측 권장값 (5.3절 참조)
-train = s2.CoefficientWindowSampler(X, hw, centers, train_idx,
-                                    window=WINDOW, window_offset=OFFSET,
-                                    batch_size=512,
-                                    traces_per_batch=32, shift_aug=1, seed=0)
-val   = s2.CoefficientWindowSampler(X, hw, centers, val_idx,
-                                    window=WINDOW, window_offset=OFFSET,
-                                    batch_size=512,
-                                    traces_per_batch=32, shift_aug=0, seed=1)
+다음은 기존 실행 설정을 새 디렉터리에서 재현하는 명령이다. 이 문서 정리 작업에서
+추가 학습을 실행한 것은 아니다.
 
-# 5) 학습
-model = vm.compile_model(vm.build_model(window=WINDOW))
-model.fit(s2.to_tf_dataset(train),
-          validation_data=s2.to_tf_dataset(val),
-          steps_per_epoch=train.steps_per_epoch(),
-          validation_steps=200, epochs=50,
-          callbacks=vm.make_callbacks())
-
-# 6) 정직한 평가 (공격셋을 캘리브레이션/평가로 분리)
-probs = vm.predict_coefficient_probs(model, atk_sampler, atk_idx, poly=0, coeff=50)
-T, _  = ev.fit_temperature(probs[cal], hw_true[cal])     # 공격셋 미사용
-lp    = ev.implicit_log_prior(probs[cal])
-L     = ev.trace_log_likelihood(probs[atk], T, lp)
-cands, tidx = ev.build_candidate_residues(65536, seed=42, true_s=true_s)
-ge, sr, ge_full = ev.guessing_entropy(L, c_vals, 50, cands, tidx)
-ev.summarize(ge, sr, ge_full, label="v3")
+```bash
+PYTHONUNBUFFERED=1 ./.venv-v3/bin/python "project v3/v3_train.py" \
+  --mode single --epochs 50 --batch-size 512 --traces-per-batch 32 \
+  --validation-steps 200 --window 96 --window-offset 24 --shift-aug 1 \
+  --val-set 4 --report-every 1000 --seed 0 \
+  --out-dir artifacts/v3/training_single_rerun
 ```
 
-### 7.3 Apple Silicon에서 알아둘 것
+stdout에 1000배치마다 누적 train 지표, epoch 끝에 validation 지표를 기록한다.
+`history.csv`는 epoch별 지표를 저장하고, `best.keras`는 최저 validation loss,
+`final.keras`는 best 가중치를 복원한 종료 모델이다. 이번 실행은 44 epoch에서
+조기 종료됐다.
 
-M시리즈 칩은 CPU와 GPU가 **메모리를 공유**한다(통합 메모리). 그래서 데이터를
-GPU로 복사하는 비용이 없는 대신, 사본을 늘리면 그만큼 전체 메모리가 줄어든다.
-float16 memmap을 쓰는 이유가 이것이다.
+`--resume`는 best 가중치를 불러오는 기능이며 optimizer·callback 상태·epoch 번호를
+복원하는 완전한 중단 재개가 아니다. 현재 seed 옵션은 NumPy·샘플러에 적용되며
+TF 초기화까지 결정적으로 고정하지 않는다. 새 실험에서 완전 재현·resume가 필요하면
+먼저 해당 기능을 보완한다.
 
-성능에 가장 큰 영향을 주는 것은 **배치를 만드는 방식**이다. 3.2 GB 파일에서
-무작위 위치를 마구 읽으면 디스크 접근이 흩어져 느려진다. 그래서 샘플러는
-**적은 수의 트레이스만 읽고 그 안에서 계수를 많이 뽑는다.** 트레이스 한 줄이
-80 KB 연속 읽기가 되어 훨씬 빠르다.
+### 7.4 추론과 재검산
 
-그 밖의 주의사항이다.
+현재 평가 CLI는 이번 **단일 HW 모델 / set4 calibration / window 96 / offset 24**
+설정에 맞춰 검증됐다. 멀티태스크 모델이나 다른 학습 split에는 그대로 적용하지 않는다.
 
-| 항목 | 지침 |
-|---|---|
-| XLA (`jit_compile=True`) | Metal에서 지원 안 됨. 항상 끈다 |
-| `mixed_float16` | Metal에서 불안정했던 이력. 기본 off |
-| Optimizer | `legacy.Adam`이 M시리즈에서 더 빠른 사례가 있어 우선 시도 |
-| Conv1D | `metal_safe=True`면 `(k,1)` Conv2D 경로 사용 |
-| float64 | Metal에서 취약. 전 구간 float32 유지 |
-| P코어/E코어 | 스레드를 논리코어 전체로 잡으면 효율코어로 밀려 느려진다 |
+```bash
+# 기존 best 모델을 평가하고 새 결과 디렉터리에 저장
+PYTHONUNBUFFERED=1 ./.venv-v3/bin/python "project v3/v3_infer.py" \
+  --classification-batches 200 --per-coeff-traces 2000 \
+  --coefficients-per-poly 9 --target-poly 0 --target-coeff 50 \
+  --n-candidates 65536 --n-experiments 100 --max-traces 40 --seed 42 \
+  --out-dir artifacts/v3/evaluation_single_rerun
+
+# 원래 저장 결과의 독립 재검산 (추론·학습 없음)
+./.venv-v3/bin/python "project v3/v3_audit_results.py"
+```
+
+평가는 set4와 attack의 전체 계수 무작위 표본 각각 102,400윈도우, 대표 계수 전량
+각각 10,000윈도우, 대표 위치 37계수 × 2,000트레이스를 사용한다. 전역 T=0.75와
+대표 계수 T=0.80은 profiling set4에서만 선택했다.
+
+`v3_infer.py`는 `results.json`과 대표 계수 `target_predictions.npz`를 저장한다.
+재검산 CLI는 원래 `evaluation_single`의 저장 확률·CSV·원본 라벨을 읽어
+`audit.json`을 갱신한다. 기본 평가 출력 디렉터리는 기존 결과와 같으므로
+새 평가에서는 위처럼 `--out-dir`를 지정한다.
+
+### 7.5 Apple Silicon 실행 메모
+
+이번 실행은 float32 모델 연산, float16 디스크 저장, Metal-safe Conv2D 경로,
+XLA 비활성 설정을 사용했다. Keras 3의 legacy Adam 생성 실패 시 표준 Adam으로
+전환하도록 백엔드를 수정했다. mixed precision은 이번 실행에서 사용하지 않았다.
+
+통합 메모리에서도 프레임워크 텐서 변환·사본의 비용이 없다고 가정하지 않는다.
+샘플러의 적은 트레이스·다수 계수 배치 구조는 연속 읽기 지역성을 높이기 위한 것이다.
+스레드·배치·정밀도 변경은 실제 처리량과 수치·성능을 확인한 뒤 결정한다.
 
 ---
 
 ## 8. 어디까지 검증했는가
 
-이 구분은 중요하다. 코드마다 신뢰 수준이 다르다.
+2026-10-14 상태는 다음과 같다. 상세 근거와 평가 제한은
+[결과 보고서](results_report.md)에 있다.
 
-**실제 트레이스로 검증됨**
+| 범위 | 현재 확인 결과 |
+|---|---|
+| 데이터 헤더·shape/dtype | 전체 필수 파일 로더 검사 통과 |
+| MR 관계 | 원래 키 기준 전체 공격 10,240,000값 불일치 0 |
+| Metal 환경·실제 CNN 학습 | M5 Pro에서 44 epoch 학습 완료 |
+| 공격 분류 | 전체 계수 표본 Top-1 66.625%, 대표 계수 전량 69.87% |
+| 후보 랭킹 | 대표 계수 후보 표본 GE/SR 실측과 저장 확률 재계산 일치 |
+| 계수별 진단 | 37개 위치에서 측정, 최저 Top-1 39.35% |
+| checkpoint 복원 | best/final 레이어 가중치 49개 전부 동일 |
+| 멀티태스크·앙상블 | 이번 CNN으로 미실행, 이전 선형 프로브 기준값 유지 |
+| 전체 q공간·1024계수 동시 복구 | 미실행 |
 
-전체 15.3 GB는 실측 대역폭 약 0.18 MB/s로 24시간이 걸려 받을 수 없었다.
-대신 `.npy` 파일이 행 단위로 순서대로 저장된다는 점을 이용해, **HTTP Range 요청으로
-앞부분 600행만 잘라 받았다**(183 MB, 8개 병렬 다운로드). 행 `i`의 시작 바이트는
-`128 + i × 320000`이다.
+초기 탐색은 attack 앞 600행과 라벨, profiling 일부 표본으로 시간 매핑·필터 등을
+측정했다. 현재 전체 데이터가 로컬에 있지만, 이 설계 이력 때문에 attack을 전체
+설계 과정의 완전한 미사용 holdout으로 부르지는 않는다.
 
-- poly0/coeff50의 상관 피크가 **샘플 1828, |rho| = 0.7044** — `rho.npy` 예측과 정확히 일치
-- 1024개 계수 위치 전량 실측 (`time_map.json`)
-- 이동평균 폭 스윕, 이득 보정 효과, 계수 불변성, 증강 트레이드오프
-- **캠페인 간 이식성** — 프로파일링 set1 앞 600행과 라벨 600행을 추가로 확보해 측정.
-  시간 매핑이 캠페인 간 그대로 전이되고(위치 차이 중앙값 0샘플),
-  전이 손실이 1.4%에 불과하다.
-- `v3_common`, `v3_normalize`, `v3_stage2_data`의 numpy 계층 전부
-
-**합성 데이터로만 검증됨**
-
-- `v3_evaluate` — 진짜 `c`/`u`/`s`는 썼지만 모델은 정확도를 제어한 가상 모델이다.
-  실제 학습된 모델로 다시 확인해야 한다.
-
-**아직 실행하지 못함**
-
-- `v3_model`, `v3_backend`, `v3_report` — 개발 환경에 TensorFlow가 없어
-  **구문 검사와 numpy 부분만 통과**했다. Apple Silicon 실기에서 Metal 인식과
-  정밀도를 직접 확인해야 한다.
-- 실제 모델 학습과 그에 따른 정직한 GE/SR 측정.
-  (프로파일링 트레이스를 600행만 확보해 본격 학습은 불가)
+set4는 checkpoint 선택과 calibration을 겸하고, 전처리 통계의 원래 생성 manifest도
+부족하다. 중심 잔여류로 바꾼 키의 MR 출력은 원래 라벨과 0.061416% 차이가 난다.
+이 제한들을 명시한 조건에서 현재 수치를 공유할 수 있다.
 
 ---
 
 ## 9. 다음에 할 일
 
-1. 프로파일링 트레이스 부분 확보 → **캠페인 간 이식성 측정**.
-   지금 미검증으로 남은 것 중 가장 큰 건이다. `per_trace_gain`과
-   `vertical_source="own"`의 실제 가치가 여기서 판가름 난다.
-2. Apple Silicon 실기에서 모델 학습 1회 완주 → Metal 동작 확인
-3. 실제 모델로 정직한 GE/SR 측정 → 완벽 오라클(N=6)과 비교
-4. 1024계수 전체 복구 시도
+다음 학습의 실험 순서와 채택 기준은 [학습 개선 분석](training_improvements.md)에 있다.
 
-Stage 1을 정직하게 통과하면 **GE 수치가 v2 보고치보다 나빠 보일 수 있다.**
-그것이 정상이며, 그 수치가 이후 개선을 재는 유일한 기준선이다.
+1. profiling 데이터에서 1024계수 전량 진단과 경계 위치의 시간 매핑·문맥 확인.
+2. 모델 선택/calibration/최종 평가를 트레이스 단위로 분리하고 고정 validation과
+   전처리 config·통계·split·해시 manifest 저장.
+3. 경계 문맥 처리·약한 위치 sampling·smoothing·온도/prior를 동일 예산으로 A/B.
+4. 멀티태스크·앙상블을 새 calibration에서 비교하고 약한 계수 랭킹 이득 검증.
+5. signed MR 대표원 가정을 정리한 뒤 q공간 전량과 1024계수 공통 트레이스 복구 평가.

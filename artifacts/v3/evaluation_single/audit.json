@@ -1,0 +1,123 @@
+{
+  "audited_at": "2026-10-14T22:01:16+09:00",
+  "source_results_sha256": "533cc699026ed128a9334c62d92e9cb52b74545f94cd8e9cd8610b9f45b98021",
+  "checks": [
+    {
+      "name": "history_epochs",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "best_epoch",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "best_metrics",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "validation_probabilities",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "validation_classification",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "attack_probabilities",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "attack_classification",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "target_temperature",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "candidate_count",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "attack_curves_recomputed",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "mid_rank_ties",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "validation_raw_ece",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "validation_calibrated_ece",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "attack_raw_ece",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "attack_calibrated_ece",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "coefficient_summary",
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "best_final_all_layer_weights",
+      "passed": true,
+      "detail": {
+        "arrays_compared": 49
+      }
+    },
+    {
+      "name": "mr_original_key_full_attack",
+      "passed": true,
+      "detail": {
+        "values_checked": 10240000
+      }
+    }
+  ],
+  "all_passed": true,
+  "representative_groups": {
+    "boundary": {
+      "n_coefficients": 8,
+      "mean_top1": 0.5011875
+    },
+    "interior": {
+      "n_coefficients": 29,
+      "mean_top1": 0.6717068965517241
+    }
+  },
+  "mr_centered_representative": {
+    "mismatches": 6289,
+    "total": 10240000,
+    "fraction": 0.00061416015625,
+    "note": "Residue-equivalent MR outputs can have different signed HW at overflow boundaries."
+  },
+  "limits": [
+    "Random 102400-window probabilities were not saved; top-k metrics for that sample cannot be independently recomputed from NPZ.",
+    "Calibration reuses profiling set4, also used for model selection.",
+    "Candidate ranks cover a fixed sampled candidate set, not exhaustive q-space recovery.",
+    "PI/log2(q) trace counts are heuristics, not empirical full-key recovery."
+  ]
+}

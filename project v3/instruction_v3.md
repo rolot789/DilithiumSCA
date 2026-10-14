@@ -1,5 +1,10 @@
 # DSCAD Dilithium 부채널 공격 v3 설계 사양
 
+> 이 문서는 초기 설계·탐색·합성 실험 기록이다. 2026-09-23 실제 CNN 학습·추론과
+> 2026-10-14 재검증의 현재 판정은 [결과 보고서](results_report.md)를 따른다.
+> 후보 표본 GE/SR과 PI 휴리스틱은 전체 q 공간·1024계수 복구의 증명이 아니다.
+> 실행 절차는 [README](README.md), 후속 실험은 [개선 분석](training_improvements.md)에 있다.
+
 v2의 한계를 실측으로 진단하고, 정규화 / 학습 / 평가 세 축을 재설계한다.
 이 문서의 모든 수치는 원본 데이터셋 헤더, 공식 `Verification.ipynb`, 그리고
 `attack_10000_u=cs.npy` / `attack_10000_c.npy` / `attack_s.npy` 실측에서 나왔다.

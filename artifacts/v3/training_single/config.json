@@ -1,0 +1,35 @@
+{
+  "args": {
+    "dataset_dir": "/Users/9oodnight/개발/DilithiumSCA/Dataset/1-Dataset",
+    "prof_norm": "/Users/9oodnight/개발/DilithiumSCA/artifacts/v3/prof_norm.npy",
+    "time_map": "/Users/9oodnight/개발/DilithiumSCA/project v3/time_map.json",
+    "out_dir": "artifacts/v3/training_single",
+    "mode": "single",
+    "epochs": 50,
+    "batch_size": 512,
+    "traces_per_batch": 32,
+    "validation_steps": 200,
+    "window": 96,
+    "window_offset": 24,
+    "shift_aug": 1,
+    "val_set": 4,
+    "report_every": 1000,
+    "seed": 0,
+    "resume": false
+  },
+  "tensorflow": {
+    "apple_silicon": true,
+    "tf_version": "2.16.2",
+    "performance_cores": 6,
+    "gpu_devices": [
+      "/physical_device:GPU:0"
+    ],
+    "metal": true,
+    "mixed_precision": false
+  },
+  "model_params": 263297,
+  "train_samples_per_epoch": 30720000,
+  "train_steps_per_epoch": 60000,
+  "val_samples_per_epoch": 10240000,
+  "val_steps_per_epoch": 20000
+}
