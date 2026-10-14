@@ -1,4 +1,58 @@
-# DilithiumSCA
+# DilithiumSCA: Deep Learning Side-Channel Analysis of CRYSTALS-Dilithium
+
+Research code for profiling-based **power analysis of CRYSTALS-Dilithium**, focusing on coefficient-wise Montgomery reduction leakage in the Number Theoretic Transform (NTT) domain. The v3 TensorFlow CNN predicts the Hamming weight of 32-bit intermediate values and evaluates calibrated candidate key rankings.
+
+[English overview](#english-overview) · [한국어 안내](#한국어-안내)
+
+## English overview
+
+### What this repository provides
+
+- A shared CNN trained on coefficient windows, with training progress logs and checkpoint saving.
+- Hamming-weight classification, temperature calibration, and candidate-level guessing entropy (GE) / success rate (SR) evaluation.
+- Saved experimental results, independent audit tools, and an analysis of related Dilithium side-channel attacks and public datasets.
+
+The current implementation is in `project v3`; v1 and v2 are historical experiments. This is an experimental research repository, not a production cryptographic library or a verified full-key recovery benchmark.
+
+### Recorded results and limitations
+
+Training and inference finished on September 23, 2026. The saved results were audited on October 14, 2026.
+
+- Attack-campaign Hamming-weight Top-1: **66.625%**, Top-3: **96.190%**, over 102,400 sampled coefficient windows. These are window draws, not 102,400 distinct power traces.
+- Representative coefficient `(poly0, coeff50)`: **69.87%** Top-1 over 10,000 attack traces.
+- For that coefficient, SR reached **100/100 trials from 8 traces** within a fixed sample of **65,254 candidate residues**. Exhaustive ranking over `q = 8,380,417` and simultaneous recovery of all 1,024 coefficients have **not** been verified.
+
+Profiling set4 was reused for checkpoint selection and calibration. Some attack labels were used during earlier time-map development, so the current attack campaign is not a completely blind end-to-end test. The original dataset source and collection metadata remain unconfirmed. See the [results report](project%20v3/results_report.md) for metric definitions, audit coverage, and evaluation limitations.
+
+### Getting started
+
+```bash
+git clone https://github.com/rolot789/DilithiumSCA.git
+cd DilithiumSCA
+```
+
+1. Inspect the committed [evaluation results](artifacts/v3/evaluation_single/results.json), [audit record](artifacts/v3/evaluation_single/audit.json), and [training history](artifacts/v3/training_single/history.csv). Reading these records does not require the original traces.
+2. Follow the [v3 environment and execution guide](project%20v3/README.md#7-사용법) before running the Python tools. The tested training environment used Python 3.11.15, NumPy 1.26.4, TensorFlow 2.16.2, and tensorflow-metal 1.2.0 on Apple Silicon. The root `requirements.txt` is not a locked v3 environment.
+3. Training and inference require the original dataset and normalized arrays; inference also requires a trained checkpoint. The full audit requires the original dataset and the saved best/final checkpoints. These inputs are **not included** in a repository clone. The training and inference CLIs use existing normalized arrays; they do not automatically prepare the dataset.
+
+After setting up the environment, these commands show the available options without starting training or inference:
+
+```bash
+./.venv-v3/bin/python "project v3/v3_train.py" --help
+./.venv-v3/bin/python "project v3/v3_infer.py" --help
+```
+
+### Documentation
+
+The detailed research notes are currently in Korean.
+
+- [v3 implementation and execution guide](project%20v3/README.md)
+- [Training, inference, and audit report](project%20v3/results_report.md)
+- [Evidence-based training improvements](project%20v3/training_improvements.md)
+- [Related work, comparable datasets, and research directions](project%20v3/related_work_analysis.md)
+- [Initial v3 design and exploration notes](project%20v3/instruction_v3.md) — historical observations, distinct from the current CNN results.
+
+## 한국어 안내
 
 Dilithium의 계수별 Montgomery reduction 출력에 대한 전력 누설을 학습하고, Hamming Weight 예측과 후보 키 랭킹을 평가하는 연구 저장소다. 현재 실행 기준은 `project v3`이며 v1·v2는 이전 실험 기록이다.
 
